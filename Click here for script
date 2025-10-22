@@ -1,6 +1,6 @@
 ---------------------------------------------------
 --[[
-   s.ick Aimbot v2.9 - Optimized Reaction Speed & Enhanced Prediction
+   s.ick Aimbot v2.10 - 360-Degree Threat Detection
    Enhancements:
    - Instant camera snapping via high AIMBOT_SMOOTHNESS.
    - noRecoil mode enabled (instant snapping without recoil adjustments).
@@ -17,6 +17,12 @@
    - Enhanced Kalman filter now tracks both velocity and acceleration for better prediction
    - Exponential distance scaling curve for improved far-distance prediction accuracy
    - Adaptive prediction time calculation based on target distance and movement
+   
+   New Features (v2.10):
+   - 360-degree threat detection system that scans for players in all directions
+   - Visual indicators on HUD showing direction of threats outside primary FOV
+   - Configurable threat detection range and scan interval for optimal performance
+   - Toggle button to enable/disable 360-degree threat detection
 ]]--
 
 ---------------------------------------------------
@@ -94,7 +100,16 @@ local CONFIG = {
    
    -- Far Distance Optimization Settings
    BASE_DISTANCE = 250, -- Base distance for scaling prediction factor
-   MAX_MULTIPLIER = 3   -- Maximum multiplier for far distance prediction factor
+   MAX_MULTIPLIER = 3,   -- Maximum multiplier for far distance prediction factor
+   
+   -- 360-Degree Threat Detection Settings
+   THREAT_DETECTION_ENABLED = true,        -- Enable 360-degree threat detection
+   THREAT_SCAN_INTERVAL = 0.2,             -- Scan for threats every 0.2 seconds
+   THREAT_MIN_DISTANCE = 50,               -- Minimum distance to consider a threat
+   THREAT_MAX_DISTANCE = 300,              -- Maximum distance for threat detection
+   THREAT_INDICATOR_SIZE = 30,             -- Size of threat direction indicators
+   THREAT_INDICATOR_COLOR = Color3.fromRGB(255, 165, 0),  -- Orange color for indicators
+   THREAT_INDICATOR_DISTANCE = 120         -- Distance from screen center for indicators
 }
 
 -- PID state variables
@@ -111,6 +126,7 @@ local aimbotEnabled = false
 local highlightEnabled = true    -- Highlight enabled by default
 local hitboxExpanderEnabled = false
 local guiMinimized = false
+local threatDetectionEnabled = true  -- 360-degree threat detection enabled by default
 
 local playerHighlights = {}      -- [Player] = Highlight instance
 local playerHitboxParts = {}     -- [Player] = table of expander parts
@@ -127,6 +143,10 @@ local lastVisibilityUpdate = 0
 -- Pre-calculate screen center for FOV checks
 local screenCenter = nil
 local fovRadiusSq = CONFIG.AIMBOT_FOV * CONFIG.AIMBOT_FOV
+
+-- 360-Degree Threat Detection
+local threatIndicators = {}      -- [Player] = indicator frame
+local lastThreatScan = 0
 
 ---------------------------------------------------
 --// Utility Functions
@@ -315,8 +335,8 @@ barFillCorner.CornerRadius = UDim.new(1, 0)
 -- Main UI Frame
 local mainFrame = Instance.new("Frame", screenGui)
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 300, 0, 470)
-mainFrame.Position = UDim2.new(0.05, 0, 0.5, -235)
+mainFrame.Size = UDim2.new(0, 300, 0, 515)
+mainFrame.Position = UDim2.new(0.05, 0, 0.5, -257.5)
 mainFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
 mainFrame.BorderSizePixel = 1
 mainFrame.BorderColor3 = Color3.fromRGB(55, 55, 65)
@@ -420,6 +440,8 @@ currentY = currentY + 45
 local highlightBtn = createToggleButton(contentFrame, "HighlightButton", "Highlight: On", UDim2.new(0, 10, 0, currentY))
 currentY = currentY + 45
 local hitboxBtn = createToggleButton(contentFrame, "HitboxButton", "Hitbox Expander: Off", UDim2.new(0, 10, 0, currentY))
+currentY = currentY + 45
+local threatDetectionBtn = createToggleButton(contentFrame, "ThreatDetectionButton", "360° Detection: On", UDim2.new(0, 10, 0, currentY))
 currentY = currentY + 45
 
 local predictionSlider = createSlider(contentFrame, "Prediction Factor", 0, 1, CONFIG.PREDICTION_FACTOR, UDim2.new(0, 10, 0, currentY), function(val)
@@ -620,6 +642,146 @@ local function checkVisibility(character, targetPart, localCharacter)
    return isVisible
 end
 
+---------------------------------------------------
+--// 360-Degree Threat Detection Functions
+
+-- Create or update threat indicator for a player
+local function createThreatIndicator(player, angle)
+   local indicator = threatIndicators[player]
+   if not indicator then
+       indicator = Instance.new("Frame", screenGui)
+       indicator.Name = "ThreatIndicator_" .. player.Name
+       indicator.Size = UDim2.new(0, CONFIG.THREAT_INDICATOR_SIZE, 0, CONFIG.THREAT_INDICATOR_SIZE)
+       indicator.AnchorPoint = Vector2.new(0.5, 0.5)
+       indicator.BackgroundColor3 = CONFIG.THREAT_INDICATOR_COLOR
+       indicator.BorderSizePixel = 0
+       indicator.ZIndex = 10
+       
+       local corner = Instance.new("UICorner", indicator)
+       corner.CornerRadius = UDim.new(0, 4)
+       
+       -- Add arrow symbol to indicate direction
+       local arrow = Instance.new("TextLabel", indicator)
+       arrow.Size = UDim2.new(1, 0, 1, 0)
+       arrow.BackgroundTransparency = 1
+       arrow.Text = "◄"
+       arrow.TextColor3 = Color3.new(1, 1, 1)
+       arrow.TextSize = 20
+       arrow.Font = Enum.Font.SourceSansBold
+       arrow.Name = "Arrow"
+       
+       threatIndicators[player] = indicator
+   end
+   
+   -- Calculate position based on angle
+   local viewportSize = Camera.ViewportSize
+   local centerX = viewportSize.X / 2
+   local centerY = viewportSize.Y / 2
+   
+   local posX = centerX + math.cos(angle) * CONFIG.THREAT_INDICATOR_DISTANCE
+   local posY = centerY + math.sin(angle) * CONFIG.THREAT_INDICATOR_DISTANCE
+   
+   indicator.Position = UDim2.new(0, posX, 0, posY)
+   
+   -- Rotate arrow to point towards threat
+   local arrow = indicator:FindFirstChild("Arrow")
+   if arrow then
+       local rotationDegrees = math.deg(angle)
+       -- Adjust arrow rotation to point inward
+       if rotationDegrees > -90 and rotationDegrees < 90 then
+           arrow.Text = "◄"
+           arrow.Rotation = rotationDegrees
+       else
+           arrow.Text = "►"
+           arrow.Rotation = rotationDegrees + 180
+       end
+   end
+   
+   indicator.Visible = true
+   return indicator
+end
+
+-- Remove threat indicator for a player
+local function removeThreatIndicator(player)
+   if threatIndicators[player] then
+       threatIndicators[player]:Destroy()
+       threatIndicators[player] = nil
+   end
+end
+
+-- Scan for threats in all directions (360 degrees)
+local function scan360Threats()
+   if not threatDetectionEnabled then
+       -- Clear all indicators if disabled
+       for player, _ in pairs(threatIndicators) do
+           removeThreatIndicator(player)
+       end
+       return
+   end
+   
+   local currentTime = tick()
+   if currentTime - lastThreatScan < CONFIG.THREAT_SCAN_INTERVAL then
+       return
+   end
+   lastThreatScan = currentTime
+   
+   local localCharacter = LocalPlayer.Character
+   if not localCharacter then return end
+   
+   local localRoot = localCharacter.PrimaryPart or localCharacter:FindFirstChild("HumanoidRootPart")
+   if not localRoot then return end
+   
+   local threatsFound = {}
+   
+   for player, _ in pairs(playerConnections) do
+       if player == LocalPlayer then continue end
+       local character = player.Character
+       if character then
+           local humanoid = character:FindFirstChildOfClass("Humanoid")
+           local targetRoot = character.PrimaryPart or character:FindFirstChild("HumanoidRootPart")
+           
+           if humanoid and humanoid.Health > 0 and targetRoot then
+               local distance = (targetRoot.Position - localRoot.Position).Magnitude
+               
+               -- Check if player is within threat range
+               if distance >= CONFIG.THREAT_MIN_DISTANCE and distance <= CONFIG.THREAT_MAX_DISTANCE then
+                   local targetPart = character:FindFirstChild(CONFIG.AIM_PART_NAME) or targetRoot
+                   
+                   -- Check if target is outside primary FOV (behind or to the sides)
+                   local isOutsideFOV = not isInFOV(targetPart.Position)
+                   
+                   if isOutsideFOV then
+                       -- Calculate angle to threat relative to camera
+                       local toTarget = (targetRoot.Position - localRoot.Position)
+                       local cameraRight = Camera.CFrame.RightVector
+                       local cameraForward = Camera.CFrame.LookVector
+                       
+                       -- Project onto horizontal plane (ignore vertical component)
+                       local toTargetFlat = Vector3.new(toTarget.X, 0, toTarget.Z).Unit
+                       local cameraRightFlat = Vector3.new(cameraRight.X, 0, cameraRight.Z).Unit
+                       local cameraForwardFlat = Vector3.new(cameraForward.X, 0, cameraForward.Z).Unit
+                       
+                       -- Calculate angle
+                       local dotRight = toTargetFlat:Dot(cameraRightFlat)
+                       local dotForward = toTargetFlat:Dot(cameraForwardFlat)
+                       local angle = math.atan2(dotRight, dotForward)
+                       
+                       createThreatIndicator(player, angle)
+                       threatsFound[player] = true
+                   end
+               end
+           end
+       end
+   end
+   
+   -- Remove indicators for players no longer threats
+   for player, _ in pairs(threatIndicators) do
+       if not threatsFound[player] then
+           removeThreatIndicator(player)
+       end
+   end
+end
+
 -- Advanced target selection: combines target distance and health ratio.
 local function getClosestTarget()
    local bestTarget, bestScore = nil, math.huge
@@ -684,6 +846,7 @@ end
 local function onPlayerRemoving(player)
    removeHighlight(player)
    removeHitboxExpansion(player)
+   removeThreatIndicator(player)
    if playerConnections[player] then
        for _, conn in pairs(playerConnections[player]) do
            conn:Disconnect()
@@ -735,7 +898,21 @@ hitboxBtn.MouseButton1Click:Connect(function()
    setHitboxExpanderState(not hitboxExpanderEnabled)
 end)
 
+threatDetectionBtn.MouseButton1Click:Connect(function()
+   animateButtonClick(threatDetectionBtn)
+   threatDetectionEnabled = not threatDetectionEnabled
+   toggleButtonState(threatDetectionBtn, threatDetectionEnabled, "360° Detection: On", "360° Detection: Off", Color3.fromRGB(220, 70, 70), Color3.fromRGB(70, 70, 80))
+   if not threatDetectionEnabled then
+       -- Clear all threat indicators when disabled
+       for player, _ in pairs(threatIndicators) do
+           removeThreatIndicator(player)
+       end
+   end
+end)
+
 RunService.RenderStepped:Connect(function(deltaTime)
+   -- Perform 360-degree threat scanning
+   scan360Threats()
    if aimbotEnabled and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head") then
        local targetPart, targetScore = getClosestTarget()
        if targetPart then
@@ -843,7 +1020,7 @@ end)
 
 local function toggleGuiVisibility(minimized)
    guiMinimized = minimized
-   local targetSize = minimized and UDim2.new(0, 300, 0, 40) or UDim2.new(0, 300, 0, 470)
+   local targetSize = minimized and UDim2.new(0, 300, 0, 40) or UDim2.new(0, 300, 0, 515)
    local contentTransparency = minimized and 1 or 0
    minimizeBtn.Text = minimized and "O" or "_"
    
@@ -879,6 +1056,11 @@ local function cleanup()
        end
    end
    playerConnections = {}
+   -- Clean up threat indicators
+   for player, _ in pairs(threatIndicators) do
+       removeThreatIndicator(player)
+   end
+   threatIndicators = {}
    if screenGui then screenGui:Destroy() end
 end
 
@@ -904,4 +1086,4 @@ local fadeOutTween = tweenProperty(loadingBg, {BackgroundTransparency = 1}, 0.5)
 fadeOutTween.Completed:Connect(function() loadingGui:Destroy() end)
 screenGui.Enabled = true
 
-print("s.ick Aimbot v2.9: Optimized reaction speed and enhanced prediction with acceleration tracking loaded successfully.")
+print("s.ick Aimbot v2.10: Optimized reaction speed, enhanced prediction with acceleration tracking, and 360-degree threat detection loaded successfully.")
