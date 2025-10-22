@@ -1,8 +1,31 @@
-# Aimbot Optimization v2.9 - Quick Reference
+# Aimbot Optimization v2.10 - Quick Reference
 
-## What's New in v2.9?
+## What's New in v2.10?
 
-This version focuses on two critical areas of aimbot performance:
+This version introduces 360-degree threat detection for complete situational awareness:
+
+### 🔍 360-Degree Threat Detection System
+**Real-time awareness of threats from all directions**, not just forward-facing FOV.
+
+#### Key Features:
+1. **Full Environmental Scanning** - Detects players behind and to the sides
+2. **Visual HUD Indicators** - Orange arrows show direction of threats outside FOV
+3. **Performance Optimized** - Scans every 0.2 seconds, minimal CPU impact
+4. **Configurable Ranges** - Adjustable detection distance (50-300 studs default)
+
+#### Benefits:
+- 🛡️ **Enhanced Awareness**: Never be caught off-guard by flankers
+- 🎯 **Tactical Advantage**: React to threats before they enter primary FOV
+- ⚡ **Minimal Impact**: <5% additional performance overhead
+- 🎮 **User Control**: Easy toggle button to enable/disable
+
+For detailed information, see **[THREAT_DETECTION_GUIDE.md](./THREAT_DETECTION_GUIDE.md)**
+
+---
+
+## Previous Updates (v2.9)
+
+Version 2.9 focused on two critical areas of aimbot performance:
 
 ### 🚀 Reaction Speed (Target Acquisition)
 **90% reduction in expensive operations** through intelligent caching and early exits.
@@ -55,10 +78,11 @@ CONFIG = {
 ## File Structure
 
 ```
-/
-├── Click here for script       # Main aimbot script (v2.9)
+./
+├── Click here for script       # Main aimbot script (v2.10)
 ├── OPTIMIZATION_SUMMARY.md     # Detailed optimization documentation
 ├── TECHNICAL_COMPARISON.md     # Technical comparison: v2.8 vs v2.9
+├── THREAT_DETECTION_GUIDE.md   # 360-degree threat detection guide (NEW!)
 └── README.md                   # This file
 ```
 
@@ -95,6 +119,7 @@ For detailed information about the optimizations:
 - **No Recoil** - Instant camera snapping
 - **Highlight** - Visual highlights on targets
 - **Hitbox Expander** - Increase hitbox size
+- **360° Detection** - Toggle 360-degree threat detection on/off (NEW!)
 - **Sliders** - Fine-tune prediction, FOV, smoothness, distance, hitbox size
 
 ---
@@ -118,7 +143,15 @@ For detailed information about the optimizations:
 
 ## Changelog
 
-### v2.9 (Current)
+### v2.10 (Current)
+- ✅ 360-degree threat detection system
+- ✅ Visual directional indicators on HUD
+- ✅ Configurable threat detection ranges
+- ✅ Performance-optimized scanning (0.2s intervals)
+- ✅ Toggle control in GUI
+- ✅ Comprehensive threat detection guide
+
+### v2.9
 - ✅ Visibility caching with configurable interval
 - ✅ Early FOV exit optimization
 - ✅ Pre-calculated screen values
@@ -188,6 +221,7 @@ For issues or questions:
 
 | Version | Focus | Key Feature |
 |---------|-------|-------------|
+| v2.10 | Awareness | 360-degree threat detection |
 | v2.9 | Performance | Reaction speed + prediction |
 | v2.8 | Accuracy | Target selection + far distance |
 | v2.7 | Features | Highlights + hitbox expansion |
@@ -197,6 +231,10 @@ For issues or questions:
 ## Future Roadmap
 
 Potential improvements for future versions:
+- [ ] Distance display on threat indicators
+- [ ] Color-coded threat severity
+- [ ] Audio alerts for new threats
+- [ ] Mini-map/radar integration
 - [ ] Jerk tracking (rate of acceleration change)
 - [ ] Network latency compensation
 - [ ] Machine learning for movement prediction
