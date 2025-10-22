@@ -1,6 +1,6 @@
 ---------------------------------------------------
 --[[
-   s.ick Aimbot v2.8 - Enhanced Target Selection, Far-Distance Optimization & Pulsating Highlight
+   s.ick Aimbot v2.9 - Optimized Reaction Speed & Enhanced Prediction
    Enhancements:
    - Instant camera snapping via high AIMBOT_SMOOTHNESS.
    - noRecoil mode enabled (instant snapping without recoil adjustments).
@@ -9,6 +9,14 @@
    - Target memory: retains the previous target unless a significantly better opponent is detected.
    - For far distances, the prediction factor is scaled by the target distance.
    - Improved vivid, pulsating highlight effect that is visible through walls.
+   
+   Performance Optimizations (v2.9):
+   - Cached visibility raycasts with configurable update interval for faster target acquisition
+   - Early FOV exit checks to skip expensive calculations for out-of-FOV targets
+   - Pre-calculated screen center and FOV radius squared for faster distance checks
+   - Enhanced Kalman filter now tracks both velocity and acceleration for better prediction
+   - Exponential distance scaling curve for improved far-distance prediction accuracy
+   - Adaptive prediction time calculation based on target distance and movement
 ]]--
 
 ---------------------------------------------------
@@ -41,6 +49,7 @@ local CONFIG = {
    predictionEnabled = true,
    measurementNoise = 0.5,
    initialUncertainty = 1,
+   processNoise = 0.1,  -- For acceleration tracking
    
    -- Recoil & Camera Adjustment Settings
    noRecoilEnabled = true,  -- Force instant snapping (no recoil)
@@ -59,6 +68,10 @@ local CONFIG = {
    AIMBOT_FOV = 150,
    AIM_PART_NAME = "Head",
    REQUIRE_VISIBILITY_AIM = true,
+   
+   -- Performance Optimization Settings
+   VISIBILITY_CHECK_INTERVAL = 0.1,  -- Check visibility every 0.1 seconds instead of every frame
+   FOV_CHECK_EARLY_EXIT = true,      -- Skip expensive checks if target is outside FOV
    
    -- Highlight Configuration (AlwaysOnTop so highlights show through walls)
    HIGHLIGHT_FILL_COLOR = Color3.fromRGB(255, 50, 50),
@@ -88,6 +101,7 @@ local CONFIG = {
 local pidIntegral, previousError, filteredOutput = 0, 0, 0
 
 -- Kalman filter state per target (using target root as key)
+-- Now tracks both velocity and acceleration
 local targetKalman = {}
 
 ---------------------------------------------------
@@ -105,6 +119,14 @@ local playerConnections = {}     -- [Player] = table of connection objects
 -- For target memory
 local previousTarget = nil
 local previousTargetScore = math.huge
+
+-- Performance optimization: Cache visibility results
+local visibilityCache = {}       -- [Character] = {isVisible: bool, lastCheck: tick()}
+local lastVisibilityUpdate = 0
+
+-- Pre-calculate screen center for FOV checks
+local screenCenter = nil
+local fovRadiusSq = CONFIG.AIMBOT_FOV * CONFIG.AIMBOT_FOV
 
 ---------------------------------------------------
 --// Utility Functions
@@ -407,6 +429,7 @@ currentY = currentY + 50
 
 local fovSlider = createSlider(contentFrame, "FOV", 10, 500, CONFIG.AIMBOT_FOV, UDim2.new(0, 10, 0, currentY), function(val)
    CONFIG.AIMBOT_FOV = val
+   fovRadiusSq = val * val  -- Update cached value
    fovCircle.Size = UDim2.new(0, CONFIG.AIMBOT_FOV * 2, 0, CONFIG.AIMBOT_FOV * 2)
 end)
 currentY = currentY + 50
@@ -557,6 +580,46 @@ end
 ---------------------------------------------------
 --// Target Acquisition & Ranking
 
+-- Helper function to check if target is within FOV (fast check using screen position)
+local function isInFOV(targetPosition)
+   if not screenCenter then
+       local viewportSize = Camera.ViewportSize
+       screenCenter = Vector2.new(viewportSize.X / 2, viewportSize.Y / 2)
+   end
+   
+   local screenPos, onScreen = Camera:WorldToScreenPoint(targetPosition)
+   if not onScreen then return false end
+   
+   local screenPos2D = Vector2.new(screenPos.X, screenPos.Y)
+   local distanceSq = (screenPos2D - screenCenter).Magnitude ^ 2
+   return distanceSq <= fovRadiusSq
+end
+
+-- Helper function to check visibility with caching
+local function checkVisibility(character, targetPart, localCharacter)
+   local currentTime = tick()
+   local cached = visibilityCache[character]
+   
+   -- Use cached result if still valid
+   if cached and (currentTime - cached.lastCheck) < CONFIG.VISIBILITY_CHECK_INTERVAL then
+       return cached.isVisible
+   end
+   
+   -- Perform visibility check
+   local raycastParams = RaycastParams.new()
+   raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+   raycastParams.FilterDescendantsInstances = {localCharacter}
+   
+   local direction = (targetPart.Position - Camera.CFrame.Position).Unit
+   local rayResult = Workspace:Raycast(Camera.CFrame.Position, direction * CONFIG.MAX_DISTANCE, raycastParams)
+   local isVisible = (not rayResult) or (rayResult.Instance and rayResult.Instance:IsDescendantOf(character))
+   
+   -- Cache the result
+   visibilityCache[character] = {isVisible = isVisible, lastCheck = currentTime}
+   
+   return isVisible
+end
+
 -- Advanced target selection: combines target distance and health ratio.
 local function getClosestTarget()
    local bestTarget, bestScore = nil, math.huge
@@ -565,10 +628,6 @@ local function getClosestTarget()
    
    local localPrimary = localCharacter.PrimaryPart or localCharacter:FindFirstChild("HumanoidRootPart")
    if not localPrimary then return nil end
-
-   local raycastParams = RaycastParams.new()
-   raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
-   raycastParams.FilterDescendantsInstances = {localCharacter}
    
    for player, _ in pairs(playerConnections) do
        if player == LocalPlayer then continue end
@@ -577,12 +636,16 @@ local function getClosestTarget()
            local targetPart = character:FindFirstChild(CONFIG.AIM_PART_NAME)
            local humanoid = character:FindFirstChildOfClass("Humanoid")
            if targetPart and humanoid and humanoid.Health > 0 then
+               -- Early exit: Check FOV first (cheapest check)
+               if CONFIG.FOV_CHECK_EARLY_EXIT and not isInFOV(targetPart.Position) then
+                   continue
+               end
+               
                local targetPrimary = character.PrimaryPart or character:FindFirstChild("HumanoidRootPart")
                if not targetPrimary then continue end
                
-               local direction = (targetPart.Position - Camera.CFrame.Position).Unit
-               local rayResult = Workspace:Raycast(Camera.CFrame.Position, direction * CONFIG.MAX_DISTANCE, raycastParams)
-               local isVisible = (not rayResult) or (rayResult.Instance and rayResult.Instance:IsDescendantOf(character))
+               -- Check visibility (with caching)
+               local isVisible = checkVisibility(character, targetPart, localCharacter)
                if isVisible then
                    local distance = (targetPrimary.Position - localPrimary.Position).Magnitude
                    local healthRatio = (humanoid.Health or 100) / (humanoid.MaxHealth or 100)
@@ -626,6 +689,18 @@ local function onPlayerRemoving(player)
            conn:Disconnect()
        end
        playerConnections[player] = nil
+   end
+   -- Clear visibility cache for this player's character
+   if player.Character then
+       visibilityCache[player.Character] = nil
+   end
+   -- Clear Kalman filter state
+   local character = player.Character
+   if character then
+       local root = character.PrimaryPart or character:FindFirstChild("HumanoidRootPart")
+       if root then
+           targetKalman[root] = nil
+       end
    end
 end
 
@@ -681,24 +756,59 @@ RunService.RenderStepped:Connect(function(deltaTime)
            if CONFIG.predictionEnabled and targetRoot and targetRoot:IsA("BasePart") then
                local dt = deltaTime
                local measuredVel = targetRoot.Velocity
-
+               local localRoot = LocalPlayer.Character.PrimaryPart or LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+               
+               -- Enhanced Kalman filter with acceleration tracking
                local state = targetKalman[targetRoot]
                if not state then
-                   state = { velocity = measuredVel, uncertainty = CONFIG.initialUncertainty }
+                   state = {
+                       velocity = measuredVel,
+                       acceleration = Vector3.new(0, 0, 0),
+                       uncertainty = CONFIG.initialUncertainty,
+                       lastVelocity = measuredVel,
+                       lastUpdateTime = tick()
+                   }
                end
-
-               local predictedVel = state.velocity
-               local measurementResidual = measuredVel - predictedVel
-               local kalmanGain = state.uncertainty / (state.uncertainty + CONFIG.measurementNoise)
-               state.velocity = predictedVel + measurementResidual * kalmanGain
-               state.uncertainty = (1 - kalmanGain) * state.uncertainty
+               
+               -- Calculate acceleration from velocity change
+               local currentTime = tick()
+               local timeDelta = currentTime - state.lastUpdateTime
+               if timeDelta > 0 then
+                   local measuredAccel = (measuredVel - state.lastVelocity) / timeDelta
+                   
+                   -- Predict velocity using previous acceleration
+                   local predictedVel = state.velocity + state.acceleration * timeDelta
+                   local velocityResidual = measuredVel - predictedVel
+                   
+                   -- Kalman gain for velocity
+                   local kalmanGain = state.uncertainty / (state.uncertainty + CONFIG.measurementNoise)
+                   state.velocity = predictedVel + velocityResidual * kalmanGain
+                   state.uncertainty = (1 - kalmanGain) * state.uncertainty + CONFIG.processNoise
+                   
+                   -- Update acceleration with smoothing
+                   local accelGain = 0.3  -- Smoothing factor for acceleration
+                   state.acceleration = state.acceleration + (measuredAccel - state.acceleration) * accelGain
+                   
+                   state.lastVelocity = measuredVel
+                   state.lastUpdateTime = currentTime
+               end
                
                targetKalman[targetRoot] = state
                
-               -- Far-distance improvement: scale prediction factor based on target distance.
-               local distance = (targetRoot.Position - LocalPlayer.Character.PrimaryPart.Position).Magnitude
-               local multiplier = math.clamp(distance / CONFIG.BASE_DISTANCE, 1, CONFIG.MAX_MULTIPLIER)
-               predictedPos = targetRoot.Position + state.velocity * CONFIG.PREDICTION_FACTOR * multiplier
+               -- Exponential distance scaling for better far-distance prediction
+               local distance = (targetRoot.Position - localRoot.Position).Magnitude
+               local normalizedDist = math.min(distance / CONFIG.BASE_DISTANCE, 3)
+               -- Use exponential curve: multiplier = 1 + (e^(normalizedDist/2) - 1) * scaleFactor
+               local multiplier = 1 + (math.exp(normalizedDist * 0.5) - 1) * 0.4
+               multiplier = math.clamp(multiplier, 1, CONFIG.MAX_MULTIPLIER)
+               
+               -- Adaptive prediction time based on distance and velocity
+               local predictionTime = CONFIG.PREDICTION_FACTOR * multiplier
+               
+               -- Use both velocity and acceleration for prediction
+               predictedPos = targetRoot.Position + 
+                              state.velocity * predictionTime + 
+                              state.acceleration * (predictionTime * predictionTime * 0.5)
            end
            
            local targetCFrame = CFrame.new(Camera.CFrame.Position, predictedPos)
@@ -794,4 +904,4 @@ local fadeOutTween = tweenProperty(loadingBg, {BackgroundTransparency = 1}, 0.5)
 fadeOutTween.Completed:Connect(function() loadingGui:Destroy() end)
 screenGui.Enabled = true
 
-print("s.ick Aimbot: Enhanced target tracking and improved far-distance prediction with vivid highlight loaded successfully.")
+print("s.ick Aimbot v2.9: Optimized reaction speed and enhanced prediction with acceleration tracking loaded successfully.")
