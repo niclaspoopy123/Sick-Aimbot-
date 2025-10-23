@@ -604,10 +604,8 @@ end
 
 -- Helper function to check if target is within FOV (fast check using screen position)
 local function isInFOV(targetPosition)
-   if not screenCenter then
-       local viewportSize = Camera.ViewportSize
-       screenCenter = Vector2.new(viewportSize.X / 2, viewportSize.Y / 2)
-   end
+   local viewportSize = Camera.ViewportSize
+   screenCenter = Vector2.new(viewportSize.X / 2, viewportSize.Y / 2)
    
    local screenPos, onScreen = Camera:WorldToScreenPoint(targetPosition)
    if not onScreen then return false end
