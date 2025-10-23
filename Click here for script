@@ -1,6 +1,6 @@
 ---------------------------------------------------
 --[[
-   s.ick Aimbot v2.10 - 360-Degree Threat Detection
+   s.ick Aimbot v2.11 - Full 360-Degree Targeting
    Enhancements:
    - Instant camera snapping via high AIMBOT_SMOOTHNESS.
    - noRecoil mode enabled (instant snapping without recoil adjustments).
@@ -12,7 +12,6 @@
    
    Performance Optimizations (v2.9):
    - Cached visibility raycasts with configurable update interval for faster target acquisition
-   - Early FOV exit checks to skip expensive calculations for out-of-FOV targets
    - Pre-calculated screen center and FOV radius squared for faster distance checks
    - Enhanced Kalman filter now tracks both velocity and acceleration for better prediction
    - Exponential distance scaling curve for improved far-distance prediction accuracy
@@ -23,6 +22,11 @@
    - Visual indicators on HUD showing direction of threats outside primary FOV
    - Configurable threat detection range and scan interval for optimal performance
    - Toggle button to enable/disable 360-degree threat detection
+   
+   New Features (v2.11):
+   - Removed early FOV exit check to enable true 360-degree aiming capability
+   - Aimbot can now detect and aim at players behind the camera
+   - Full spherical targeting for complete tactical advantage
 ]]--
 
 ---------------------------------------------------
@@ -796,11 +800,6 @@ local function getClosestTarget()
            local targetPart = character:FindFirstChild(CONFIG.AIM_PART_NAME)
            local humanoid = character:FindFirstChildOfClass("Humanoid")
            if targetPart and humanoid and humanoid.Health > 0 then
-               -- Early exit: Check FOV first (cheapest check)
-               if CONFIG.FOV_CHECK_EARLY_EXIT and not isInFOV(targetPart.Position) then
-                   continue
-               end
-               
                local targetPrimary = character.PrimaryPart or character:FindFirstChild("HumanoidRootPart")
                if not targetPrimary then continue end
                
@@ -1084,4 +1083,4 @@ local fadeOutTween = tweenProperty(loadingBg, {BackgroundTransparency = 1}, 0.5)
 fadeOutTween.Completed:Connect(function() loadingGui:Destroy() end)
 screenGui.Enabled = true
 
-print("s.ick Aimbot v2.10: Optimized reaction speed, enhanced prediction with acceleration tracking, and 360-degree threat detection loaded successfully.")
+print("s.ick Aimbot v2.11: Full 360-degree targeting enabled - optimized reaction speed, enhanced prediction with acceleration tracking, and complete spherical aiming capability loaded successfully.")
