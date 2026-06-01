@@ -1,6 +1,6 @@
 ---------------------------------------------------
 --[[
-   s.ick Aimbot v2.11 - Full 360-Degree Targeting
+   s.ick Aimbot v2.12 - Full 360-Degree Targeting
    Enhancements:
    - Instant camera snapping via high AIMBOT_SMOOTHNESS.
    - noRecoil mode enabled (instant snapping without recoil adjustments).
@@ -27,6 +27,13 @@
    - Removed early FOV exit check to enable true 360-degree aiming capability
    - Aimbot can now detect and aim at players behind the camera
    - Full spherical targeting for complete tactical advantage
+   
+   New Features (v2.12):
+   - Triggerbot: auto-fires when crosshair is on target with configurable delay
+   - Team Check: skip teammates when targeting (toggle in GUI)
+   - Wall Check: toggle visibility requirement on/off in GUI
+   - FOV Check: toggle FOV restriction on/off in GUI
+   - Aim Sensitivity: adjustable sensitivity multiplier for aim speed
 ]]--
 
 ---------------------------------------------------
@@ -113,7 +120,22 @@ local CONFIG = {
    THREAT_MAX_DISTANCE = 300,              -- Maximum distance for threat detection
    THREAT_INDICATOR_SIZE = 30,             -- Size of threat direction indicators
    THREAT_INDICATOR_COLOR = Color3.fromRGB(255, 165, 0),  -- Orange color for indicators
-   THREAT_INDICATOR_DISTANCE = 120         -- Distance from screen center for indicators
+   THREAT_INDICATOR_DISTANCE = 120,        -- Distance from screen center for indicators
+    
+   -- Triggerbot Settings
+   TRIGGERBOT_DELAY = 0.05,                -- Delay before firing (seconds)
+    
+   -- Team Check Settings
+   TEAM_CHECK_ENABLED = true,              -- Skip teammates when targeting
+    
+   -- Wall Check Settings
+   WALL_CHECK_ENABLED = true,              -- Only aim at visible targets (not behind walls)
+    
+   -- FOV Check Settings
+   FOV_CHECK_ENABLED = true,               -- Only aim at targets within FOV circle
+    
+   -- Aim Sensitivity Settings
+   AIM_SENSITIVITY = 1.0                   -- Aim sensitivity multiplier (0.1 = slow, 2.0 = fast)
 }
 
 -- PID state variables
@@ -131,6 +153,10 @@ local highlightEnabled = true    -- Highlight enabled by default
 local hitboxExpanderEnabled = false
 local guiMinimized = false
 local threatDetectionEnabled = true  -- 360-degree threat detection enabled by default
+local triggerbotEnabled = false      -- Triggerbot disabled by default
+local teamCheckEnabled = true        -- Team check enabled by default
+local wallCheckEnabled = true        -- Wall check enabled by default
+local fovCheckEnabled = true         -- FOV check enabled by default
 
 local playerHighlights = {}      -- [Player] = Highlight instance
 local playerHitboxParts = {}     -- [Player] = table of expander parts
@@ -339,8 +365,8 @@ barFillCorner.CornerRadius = UDim.new(1, 0)
 -- Main UI Frame
 local mainFrame = Instance.new("Frame", screenGui)
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 300, 0, 515)
-mainFrame.Position = UDim2.new(0.05, 0, 0.5, -257.5)
+mainFrame.Size = UDim2.new(0, 300, 0, 550)
+mainFrame.Position = UDim2.new(0.05, 0, 0.5, -275)
 mainFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
 mainFrame.BorderSizePixel = 1
 mainFrame.BorderColor3 = Color3.fromRGB(55, 55, 65)
@@ -397,13 +423,17 @@ closeBtn.BackgroundColor3 = Color3.fromRGB(220, 60, 60)
 local closeCorner = Instance.new("UICorner", closeBtn)
 closeCorner.CornerRadius = UDim.new(0, 4)
 
--- Content Frame
-local contentFrame = Instance.new("Frame", mainFrame)
+-- Content Frame (Scrollable)
+local contentFrame = Instance.new("ScrollingFrame", mainFrame)
 contentFrame.Name = "Content"
 contentFrame.Size = UDim2.new(1, 0, 1, -40)
 contentFrame.Position = UDim2.new(0, 0, 0, 40)
 contentFrame.BackgroundTransparency = 1
 contentFrame.ClipsDescendants = true
+contentFrame.ScrollBarThickness = 4
+contentFrame.ScrollBarImageColor3 = Color3.fromRGB(150, 150, 150)
+contentFrame.CanvasSize = UDim2.new(0, 0, 0, 780)
+contentFrame.BorderSizePixel = 0
 
 local creditsLabel = Instance.new("TextLabel", contentFrame)
 creditsLabel.Name = "Credits"
@@ -447,6 +477,14 @@ local hitboxBtn = createToggleButton(contentFrame, "HitboxButton", "Hitbox Expan
 currentY = currentY + 45
 local threatDetectionBtn = createToggleButton(contentFrame, "ThreatDetectionButton", "360° Detection: On", UDim2.new(0, 10, 0, currentY))
 currentY = currentY + 45
+local triggerbotBtn = createToggleButton(contentFrame, "TriggerbotButton", "Triggerbot: Off", UDim2.new(0, 10, 0, currentY))
+currentY = currentY + 45
+local teamCheckBtn = createToggleButton(contentFrame, "TeamCheckButton", "Team Check: On", UDim2.new(0, 10, 0, currentY))
+currentY = currentY + 45
+local wallCheckBtn = createToggleButton(contentFrame, "WallCheckButton", "Wall Check: On", UDim2.new(0, 10, 0, currentY))
+currentY = currentY + 45
+local fovCheckBtn = createToggleButton(contentFrame, "FOVCheckButton", "FOV Check: On", UDim2.new(0, 10, 0, currentY))
+currentY = currentY + 45
 
 local predictionSlider = createSlider(contentFrame, "Prediction Factor", 0, 1, CONFIG.PREDICTION_FACTOR, UDim2.new(0, 10, 0, currentY), function(val)
    CONFIG.PREDICTION_FACTOR = val
@@ -480,6 +518,16 @@ local hitboxSizeSlider = createSlider(contentFrame, "Hitbox Size", 0.1, 5, CONFI
            end
        end
    end
+end)
+currentY = currentY + 50
+
+local sensitivitySlider = createSlider(contentFrame, "Aim Sensitivity", 0.1, 2.0, CONFIG.AIM_SENSITIVITY, UDim2.new(0, 10, 0, currentY), function(val)
+   CONFIG.AIM_SENSITIVITY = val
+end)
+currentY = currentY + 50
+
+local triggerbotDelaySlider = createSlider(contentFrame, "Triggerbot Delay", 0, 0.5, CONFIG.TRIGGERBOT_DELAY, UDim2.new(0, 10, 0, currentY), function(val)
+   CONFIG.TRIGGERBOT_DELAY = val
 end)
 
 ---------------------------------------------------
@@ -795,6 +843,12 @@ local function getClosestTarget()
    
    for player, _ in pairs(playerConnections) do
        if player == LocalPlayer then continue end
+        
+       -- Team check: skip teammates
+       if teamCheckEnabled and player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then
+           continue
+       end
+        
        local character = player.Character
        if character then
            local targetPart = character:FindFirstChild(CONFIG.AIM_PART_NAME)
@@ -802,20 +856,27 @@ local function getClosestTarget()
            if targetPart and humanoid and humanoid.Health > 0 then
                local targetPrimary = character.PrimaryPart or character:FindFirstChild("HumanoidRootPart")
                if not targetPrimary then continue end
-               
-               -- Check visibility (with caching)
-               local isVisible = checkVisibility(character, targetPart, localCharacter)
-               if isVisible then
-                   local distance = (targetPrimary.Position - localPrimary.Position).Magnitude
-                   local healthRatio = (humanoid.Health or 100) / (humanoid.MaxHealth or 100)
-                   local score = distance * healthRatio  -- Lower score is better
-                   if previousTarget and player == previousTarget then
-                       score = score * 0.9  -- Bias to maintain current target
-                   end
-                   if score < bestScore then
-                       bestScore = score
-                       bestTarget = targetPart
-                   end
+                
+               -- FOV check: skip targets outside FOV when enabled
+               if fovCheckEnabled and not isInFOV(targetPart.Position) then
+                   continue
+               end
+                
+               -- Wall check: skip targets behind walls when enabled
+               if wallCheckEnabled then
+                   local isVisible = checkVisibility(character, targetPart, localCharacter)
+                   if not isVisible then continue end
+               end
+                
+               local distance = (targetPrimary.Position - localPrimary.Position).Magnitude
+               local healthRatio = (humanoid.Health or 100) / (humanoid.MaxHealth or 100)
+               local score = distance * healthRatio  -- Lower score is better
+               if previousTarget and player == previousTarget then
+                   score = score * 0.9  -- Bias to maintain current target
+               end
+               if score < bestScore then
+                   bestScore = score
+                   bestTarget = targetPart
                end
            end
        end
@@ -905,6 +966,31 @@ threatDetectionBtn.MouseButton1Click:Connect(function()
            removeThreatIndicator(player)
        end
    end
+end)
+
+triggerbotBtn.MouseButton1Click:Connect(function()
+   animateButtonClick(triggerbotBtn)
+   triggerbotEnabled = not triggerbotEnabled
+   toggleButtonState(triggerbotBtn, triggerbotEnabled, "Triggerbot: On", "Triggerbot: Off", Color3.fromRGB(220, 70, 70), Color3.fromRGB(70, 70, 80))
+end)
+
+teamCheckBtn.MouseButton1Click:Connect(function()
+   animateButtonClick(teamCheckBtn)
+   teamCheckEnabled = not teamCheckEnabled
+   toggleButtonState(teamCheckBtn, teamCheckEnabled, "Team Check: On", "Team Check: Off", Color3.fromRGB(220, 70, 70), Color3.fromRGB(70, 70, 80))
+end)
+
+wallCheckBtn.MouseButton1Click:Connect(function()
+   animateButtonClick(wallCheckBtn)
+   wallCheckEnabled = not wallCheckEnabled
+   toggleButtonState(wallCheckBtn, wallCheckEnabled, "Wall Check: On", "Wall Check: Off", Color3.fromRGB(220, 70, 70), Color3.fromRGB(70, 70, 80))
+end)
+
+fovCheckBtn.MouseButton1Click:Connect(function()
+   animateButtonClick(fovCheckBtn)
+   fovCheckEnabled = not fovCheckEnabled
+   toggleButtonState(fovCheckBtn, fovCheckEnabled, "FOV Check: On", "FOV Check: Off", Color3.fromRGB(220, 70, 70), Color3.fromRGB(70, 70, 80))
+   fovCircle.Visible = fovCheckEnabled and aimbotEnabled
 end)
 
 RunService.RenderStepped:Connect(function(deltaTime)
@@ -1001,12 +1087,34 @@ RunService.RenderStepped:Connect(function(deltaTime)
            end
 
            local rawOutput = math.clamp(pidOutput + feedforwardTerm, 0, 1)
+           -- Apply aim sensitivity multiplier
+           rawOutput = rawOutput * CONFIG.AIM_SENSITIVITY
+           rawOutput = math.clamp(rawOutput, 0, 1)
            filteredOutput = CONFIG.outputSmoothing * filteredOutput + (1 - CONFIG.outputSmoothing) * rawOutput
-           
+            
            if CONFIG.noRecoilEnabled or CONFIG.AIMBOT_SMOOTHNESS >= 1000 then
                Camera.CFrame = targetCFrame
            else
                Camera.CFrame = Camera.CFrame:Lerp(targetCFrame, filteredOutput)
+           end
+            
+           -- Triggerbot: auto-fire when aimed at target
+           if triggerbotEnabled then
+               local aimAngle = math.deg(angleError)
+               if aimAngle < 5 then -- Within 5 degrees of target
+                   task.delay(CONFIG.TRIGGERBOT_DELAY, function()
+                       local mouse = LocalPlayer:GetMouse()
+                       if mouse then
+                           -- Simulate mouse click via VirtualInputManager if available
+                           local vim = game:GetService("VirtualInputManager")
+                           if vim then
+                               vim:SendMouseButtonEvent(mouse.X, mouse.Y, 0, true, game, 0)
+                               task.wait(0.01)
+                               vim:SendMouseButtonEvent(mouse.X, mouse.Y, 0, false, game, 0)
+                           end
+                       end
+                   end)
+               end
            end
        end
    end
@@ -1017,7 +1125,7 @@ end)
 
 local function toggleGuiVisibility(minimized)
    guiMinimized = minimized
-   local targetSize = minimized and UDim2.new(0, 300, 0, 40) or UDim2.new(0, 300, 0, 515)
+   local targetSize = minimized and UDim2.new(0, 300, 0, 40) or UDim2.new(0, 300, 0, 550)
    local contentTransparency = minimized and 1 or 0
    minimizeBtn.Text = minimized and "O" or "_"
    
@@ -1083,4 +1191,4 @@ local fadeOutTween = tweenProperty(loadingBg, {BackgroundTransparency = 1}, 0.5)
 fadeOutTween.Completed:Connect(function() loadingGui:Destroy() end)
 screenGui.Enabled = true
 
-print("s.ick Aimbot v2.11: Full 360-degree targeting enabled - optimized reaction speed, enhanced prediction with acceleration tracking, and complete spherical aiming capability loaded successfully.")
+print("s.ick Aimbot v2.12: Full 360-degree targeting enabled - triggerbot, team check, wall check, FOV check, aim sensitivity, optimized reaction speed, enhanced prediction with acceleration tracking, and complete spherical aiming capability loaded successfully.")
