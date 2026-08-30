@@ -1,0 +1,1246 @@
+---------------------------------------------------
+--[[
+   s.ick Aimbot v3.0
+   New in v3:
+   - Tabbed UI: Aimbot / Visuals / Settings tabs for a cleaner layout
+   - Aim Key: hold a configurable key to activate aimbot (default: Right Mouse Button)
+   - Smooth lerp aim with a real smoothness slider (vs. instant snap)
+   - Aim part selector: Head / Neck / UpperTorso / HumanoidRootPart
+   - Sticky target: click a name on the player list to lock onto them
+   - ESP name tags with distance label above players' heads
+   - Health bar below each player's name tag
+   - Rainbow / solid highlight color mode toggle
+   - Improved target score: blends distance, health, and screen-space FOV offset
+   - Configurable triggerbot angle threshold slider
+   - All previous v2.12 features retained (prediction, Kalman, 360° radar, team/wall/FOV checks)
+]]--
+
+---------------------------------------------------
+--// Services & Initial Variables
+
+local Players         = game:GetService("Players")
+local RunService      = game:GetService("RunService")
+local UserInputService= game:GetService("UserInputService")
+local TweenService    = game:GetService("TweenService")
+local Workspace       = workspace
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+local Camera      = Workspace.CurrentCamera
+
+---------------------------------------------------
+--// Prevent Duplicate GUIs
+
+if PlayerGui:FindFirstChild("s_ick_v3_GUI") then
+    warn("s.ick v3: GUI already exists. Halting.")
+    return
+end
+
+---------------------------------------------------
+--// Configuration
+
+local CONFIG = {
+    -- Aim
+    AIM_PART         = "Head",            -- Head | Neck | UpperTorso | HumanoidRootPart
+    AIM_KEY          = Enum.UserInputType.MouseButton2,  -- Right Mouse Button hold to aim
+    AIMBOT_FOV       = 150,
+    MAX_DISTANCE     = 500,
+    SMOOTHNESS       = 0.25,              -- Lerp alpha per frame (0.01 = slow, 1 = instant)
+    INSTANT_SNAP     = true,              -- If true, ignore smoothness and snap instantly
+
+    -- Prediction / Kalman
+    PREDICTION_FACTOR  = 0.1,
+    PREDICTION_ENABLED = true,
+    MEASUREMENT_NOISE  = 0.5,
+    PROCESS_NOISE      = 0.1,
+    INITIAL_UNCERTAINTY= 1,
+    BASE_DISTANCE      = 250,
+    MAX_MULTIPLIER     = 3,
+
+    -- Target selection
+    TARGET_SWITCH_THRESHOLD = 0.8,
+    FOV_WEIGHT              = 1.0,   -- Weight for screen-space FOV distance in scoring
+    HEALTH_WEIGHT           = 0.5,   -- Weight for health ratio in scoring
+    DISTANCE_WEIGHT         = 1.0,   -- Weight for world distance in scoring
+
+    -- Checks
+    TEAM_CHECK    = true,
+    WALL_CHECK    = true,
+    FOV_CHECK     = true,
+    VISIBILITY_CHECK_INTERVAL = 0.1,
+
+    -- Triggerbot
+    TRIGGERBOT_ENABLED = false,
+    TRIGGERBOT_DELAY   = 0.05,
+    TRIGGERBOT_ANGLE   = 5,    -- degrees within which triggerbot fires
+
+    -- Highlights
+    HIGHLIGHT_ENABLED         = true,
+    RAINBOW_HIGHLIGHT         = false,
+    HIGHLIGHT_FILL_COLOR      = Color3.fromRGB(255, 50, 50),
+    HIGHLIGHT_OUTLINE_COLOR   = Color3.fromRGB(255, 255, 255),
+    HIGHLIGHT_FILL_TRANS      = 0.35,
+    HIGHLIGHT_OUTLINE_TRANS   = 0.15,
+    HIGHLIGHT_PULSE_MIN       = 0.20,
+    HIGHLIGHT_PULSE_MAX       = 0.32,
+    HIGHLIGHT_PULSE_DURATION  = 1.0,
+    HIGHLIGHT_DEPTH_MODE      = Enum.HighlightDepthMode.AlwaysOnTop,
+
+    -- ESP
+    ESP_ENABLED    = true,
+    ESP_FONT       = Enum.Font.GothamSemibold,
+    ESP_TEXT_SIZE  = 13,
+
+    -- Hitbox Expander
+    HITBOX_ENABLED      = false,
+    HITBOX_SIZE         = 0.5,
+    HITBOX_PARTS        = {"Head","UpperTorso","LowerTorso","HumanoidRootPart"},
+
+    -- 360° Threat Radar
+    THREAT_ENABLED           = true,
+    THREAT_SCAN_INTERVAL     = 0.2,
+    THREAT_MIN_DISTANCE      = 50,
+    THREAT_MAX_DISTANCE      = 300,
+    THREAT_INDICATOR_SIZE    = 28,
+    THREAT_INDICATOR_COLOR   = Color3.fromRGB(255, 165, 0),
+    THREAT_INDICATOR_DIST    = 120,
+
+    -- Keybind
+    TOGGLE_KEY  = Enum.KeyCode.RightAlt,    -- Toggle aimbot on/off
+    CLOSE_KEY   = Enum.KeyCode.Delete,      -- Close GUI
+}
+
+---------------------------------------------------
+--// State
+
+local aimbotEnabled       = false
+local aimKeyHeld          = false
+local stickyTarget        = nil   -- Player locked via player list click
+local previousTarget      = nil
+local previousTargetScore = math.huge
+
+local highlightEnabled    = CONFIG.HIGHLIGHT_ENABLED
+local rainbowMode         = CONFIG.RAINBOW_HIGHLIGHT
+local espEnabled          = CONFIG.ESP_ENABLED
+local hitboxEnabled       = CONFIG.HITBOX_ENABLED
+local threatEnabled       = CONFIG.THREAT_ENABLED
+local triggerbotEnabled   = CONFIG.TRIGGERBOT_ENABLED
+local teamCheckEnabled    = CONFIG.TEAM_CHECK
+local wallCheckEnabled    = CONFIG.WALL_CHECK
+local fovCheckEnabled     = CONFIG.FOV_CHECK
+
+local guiMinimized        = false
+local activeTab           = "Aimbot"
+
+local playerHighlights    = {}
+local playerHitboxParts   = {}
+local playerConnections   = {}
+local playerESP           = {}      -- [Player] = {billboard, nameLabel, distLabel, hpBar, hpFill}
+local pulseTweens         = {}
+local threatIndicators    = {}
+local visibilityCache     = {}
+local targetKalman        = {}
+
+local fovRadiusSq         = CONFIG.AIMBOT_FOV * CONFIG.AIMBOT_FOV
+local lastThreatScan      = 0
+local pidIntegral, prevError, filteredOutput = 0, 0, 0
+
+---------------------------------------------------
+--// Utility
+
+local function tween(inst, props, dur, style, dir)
+    local info = TweenInfo.new(dur or 0.25, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out)
+    local t = TweenService:Create(inst, info, props)
+    t:Play()
+    return t
+end
+
+local function btnBounce(btn)
+    local s = btn.Size
+    tween(btn, {Size = s - UDim2.new(0,4,0,4)}, 0.08)
+    task.delay(0.08, function() tween(btn, {Size = s}, 0.08) end)
+end
+
+local function setBtn(btn, state, onTxt, offTxt)
+    btn.Text = state and onTxt or offTxt
+    btn.BackgroundColor3 = state and Color3.fromRGB(210,60,60) or Color3.fromRGB(70,70,82)
+end
+
+local function corner(inst, radius)
+    local c = Instance.new("UICorner", inst)
+    c.CornerRadius = radius or UDim.new(0,6)
+    return c
+end
+
+local function stroke(inst, color, thick)
+    local s = Instance.new("UIStroke", inst)
+    s.Color = color or Color3.fromRGB(60,60,70)
+    s.Thickness = thick or 1
+    return s
+end
+
+local function hsvToColor(h)
+    return Color3.fromHSV(h, 1, 1)
+end
+
+---------------------------------------------------
+--// UI Factory Helpers
+
+local function makeToggleBtn(parent, name, text, yPos)
+    local btn = Instance.new("TextButton", parent)
+    btn.Name = name
+    btn.Size = UDim2.new(1, -20, 0, 34)
+    btn.Position = UDim2.new(0, 10, 0, yPos)
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 15
+    btn.TextColor3 = Color3.new(1,1,1)
+    btn.BackgroundColor3 = Color3.fromRGB(70,70,82)
+    btn.Text = text
+    corner(btn)
+    return btn
+end
+
+local function makeSlider(parent, label, minV, maxV, defV, yPos, cb)
+    local ctr = Instance.new("Frame", parent)
+    ctr.Name = label.."_Slider"
+    ctr.Size = UDim2.new(1, -20, 0, 48)
+    ctr.Position = UDim2.new(0, 10, 0, yPos)
+    ctr.BackgroundTransparency = 1
+
+    local lbl = Instance.new("TextLabel", ctr)
+    lbl.Size = UDim2.new(0.6, 0, 0, 18)
+    lbl.Position = UDim2.new(0,0,0,0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 13
+    lbl.TextColor3 = Color3.fromRGB(210,210,210)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = label
+
+    local valLbl = Instance.new("TextLabel", ctr)
+    valLbl.Size = UDim2.new(0.4, -5, 0, 18)
+    valLbl.Position = UDim2.new(0.6, 5, 0, 0)
+    valLbl.BackgroundTransparency = 1
+    valLbl.Font = Enum.Font.Gotham
+    valLbl.TextSize = 13
+    valLbl.TextColor3 = Color3.fromRGB(180,180,180)
+    valLbl.TextXAlignment = Enum.TextXAlignment.Right
+
+    local track = Instance.new("Frame", ctr)
+    track.Size = UDim2.new(1, 0, 0, 7)
+    track.Position = UDim2.new(0, 0, 0, 26)
+    track.BackgroundColor3 = Color3.fromRGB(22,22,30)
+    corner(track, UDim.new(1,0))
+
+    local fill = Instance.new("Frame", track)
+    fill.BackgroundColor3 = Color3.fromRGB(210,55,55)
+    corner(fill, UDim.new(1,0))
+
+    local handle = Instance.new("TextButton", track)
+    handle.Size = UDim2.new(0, 15, 0, 15)
+    handle.AnchorPoint = Vector2.new(0.5, 0.5)
+    handle.BackgroundColor3 = Color3.new(1,1,1)
+    handle.Text = ""
+    handle.ZIndex = 3
+    corner(handle, UDim.new(1,0))
+    stroke(handle, Color3.fromRGB(90,90,100))
+
+    local function update(pct)
+        pct = math.clamp(pct, 0, 1)
+        handle.Position = UDim2.new(pct, 0, 0.5, 0)
+        fill.Size = UDim2.new(pct, 0, 1, 0)
+        local v = minV + (maxV - minV) * pct
+        valLbl.Text = string.format("%.2f", v)
+        if cb then cb(v) end
+    end
+
+    update((defV - minV) / (maxV - minV))
+
+    handle.MouseButton1Down:Connect(function()
+        local mc, uc
+        mc = UserInputService.InputChanged:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch then
+                local mx = UserInputService:GetMouseLocation().X
+                local pct = (mx - track.AbsolutePosition.X) / track.AbsoluteSize.X
+                update(pct)
+            end
+        end)
+        uc = UserInputService.InputEnded:Connect(function(inp)
+            if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+                mc:Disconnect(); uc:Disconnect()
+            end
+        end)
+    end)
+    return ctr
+end
+
+local function makeSectionLabel(parent, text, yPos)
+    local lbl = Instance.new("TextLabel", parent)
+    lbl.Size = UDim2.new(1, -20, 0, 20)
+    lbl.Position = UDim2.new(0, 10, 0, yPos)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 12
+    lbl.TextColor3 = Color3.fromRGB(160,160,170)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = "  " .. string.upper(text)
+    return lbl
+end
+
+---------------------------------------------------
+--// Main GUI Build
+
+local screenGui = Instance.new("ScreenGui", PlayerGui)
+screenGui.Name = "s_ick_v3_GUI"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Enabled = false
+
+-- Loading Screen
+local loadGui = Instance.new("ScreenGui", PlayerGui)
+loadGui.Name = "s_ick_v3_Load"
+
+local loadBg = Instance.new("Frame", loadGui)
+loadBg.Size = UDim2.new(1,0,1,0)
+loadBg.BackgroundColor3 = Color3.fromRGB(18,18,22)
+
+local loadWrap = Instance.new("Frame", loadBg)
+loadWrap.Size = UDim2.new(0,320,0,110)
+loadWrap.AnchorPoint = Vector2.new(0.5,0.5)
+loadWrap.Position = UDim2.new(0.5,0,0.5,0)
+loadWrap.BackgroundTransparency = 1
+
+local loadTitle = Instance.new("TextLabel", loadWrap)
+loadTitle.Size = UDim2.new(1,0,0,42)
+loadTitle.BackgroundTransparency = 1
+loadTitle.Font = Enum.Font.GothamBlack
+loadTitle.TextSize = 42
+loadTitle.TextColor3 = Color3.new(1,1,1)
+loadTitle.Text = "s.ick"
+
+local loadSub = Instance.new("TextLabel", loadWrap)
+loadSub.Size = UDim2.new(1,0,0,20)
+loadSub.Position = UDim2.new(0,0,0,46)
+loadSub.BackgroundTransparency = 1
+loadSub.Font = Enum.Font.Gotham
+loadSub.TextSize = 14
+loadSub.TextColor3 = Color3.fromRGB(160,160,160)
+loadSub.Text = "Aimbot v3.0  •  Loading..."
+
+local barBg = Instance.new("Frame", loadWrap)
+barBg.Size = UDim2.new(1,0,0,7)
+barBg.Position = UDim2.new(0,0,0,80)
+barBg.BackgroundColor3 = Color3.fromRGB(14,14,18)
+corner(barBg, UDim.new(1,0))
+
+local barFill = Instance.new("Frame", barBg)
+barFill.Size = UDim2.new(0,0,1,0)
+barFill.BackgroundColor3 = Color3.fromRGB(210,55,55)
+corner(barFill, UDim.new(1,0))
+
+-- Main Window
+local win = Instance.new("Frame", screenGui)
+win.Name = "Win"
+win.Size = UDim2.new(0, 320, 0, 540)
+win.Position = UDim2.new(0.04, 0, 0.5, -270)
+win.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+win.Active = true
+win.Draggable = true
+win.ClipsDescendants = true
+corner(win, UDim.new(0,10))
+stroke(win, Color3.fromRGB(50,50,62), 1)
+
+-- Header
+local hdr = Instance.new("Frame", win)
+hdr.Size = UDim2.new(1,0,0,42)
+hdr.BackgroundColor3 = Color3.fromRGB(38,38,48)
+hdr.BorderSizePixel = 0
+
+local hdrAccent = Instance.new("Frame", hdr)
+hdrAccent.Size = UDim2.new(1,0,0,2)
+hdrAccent.Position = UDim2.new(0,0,1,-2)
+hdrAccent.BackgroundColor3 = Color3.fromRGB(210,55,55)
+hdrAccent.BorderSizePixel = 0
+
+local titleLbl = Instance.new("TextLabel", hdr)
+titleLbl.Size = UDim2.new(0,200,1,0)
+titleLbl.Position = UDim2.new(0,14,0,0)
+titleLbl.BackgroundTransparency = 1
+titleLbl.Font = Enum.Font.GothamBold
+titleLbl.TextSize = 16
+titleLbl.TextColor3 = Color3.new(1,1,1)
+titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+titleLbl.Text = "s.ick  v3.0"
+
+local verLbl = Instance.new("TextLabel", hdr)
+verLbl.Size = UDim2.new(0,60,0,16)
+verLbl.Position = UDim2.new(0,95,0.5,-8)
+verLbl.BackgroundTransparency = 1
+verLbl.Font = Enum.Font.Gotham
+verLbl.TextSize = 11
+verLbl.TextColor3 = Color3.fromRGB(210,55,55)
+verLbl.Text = ""
+
+local minBtn = Instance.new("TextButton", hdr)
+minBtn.Size = UDim2.new(0,24,0,24)
+minBtn.Position = UDim2.new(1,-60,0.5,-12)
+minBtn.Text = "−"
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 18
+minBtn.TextColor3 = Color3.new(1,1,1)
+minBtn.BackgroundColor3 = Color3.fromRGB(65,65,78)
+corner(minBtn, UDim.new(0,4))
+
+local closeWinBtn = Instance.new("TextButton", hdr)
+closeWinBtn.Size = UDim2.new(0,24,0,24)
+closeWinBtn.Position = UDim2.new(1,-30,0.5,-12)
+closeWinBtn.Text = "✕"
+closeWinBtn.Font = Enum.Font.GothamBold
+closeWinBtn.TextSize = 14
+closeWinBtn.TextColor3 = Color3.new(1,1,1)
+closeWinBtn.BackgroundColor3 = Color3.fromRGB(200,55,55)
+corner(closeWinBtn, UDim.new(0,4))
+
+-- Tab bar
+local tabBar = Instance.new("Frame", win)
+tabBar.Size = UDim2.new(1,0,0,34)
+tabBar.Position = UDim2.new(0,0,0,42)
+tabBar.BackgroundColor3 = Color3.fromRGB(22,22,30)
+tabBar.BorderSizePixel = 0
+
+local tabNames = {"Aimbot","Visuals","Settings"}
+local tabBtns  = {}
+local tabPages = {}
+
+for i, name in ipairs(tabNames) do
+    local tb = Instance.new("TextButton", tabBar)
+    tb.Size = UDim2.new(1/#tabNames, 0, 1, 0)
+    tb.Position = UDim2.new((i-1)/#tabNames, 0, 0, 0)
+    tb.BackgroundColor3 = Color3.fromRGB(22,22,30)
+    tb.BorderSizePixel = 0
+    tb.Font = Enum.Font.GothamSemibold
+    tb.TextSize = 13
+    tb.TextColor3 = Color3.fromRGB(150,150,160)
+    tb.Text = name
+    tabBtns[name] = tb
+
+    local page = Instance.new("ScrollingFrame", win)
+    page.Name = name.."Page"
+    page.Size = UDim2.new(1,0,1,-76)
+    page.Position = UDim2.new(0,0,0,76)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 3
+    page.ScrollBarImageColor3 = Color3.fromRGB(120,120,130)
+    page.CanvasSize = UDim2.new(0,0,0,600)
+    page.Visible = name == "Aimbot"
+    tabPages[name] = page
+end
+
+local tabUnderline = Instance.new("Frame", tabBar)
+tabUnderline.Size = UDim2.new(1/#tabNames, 0, 0, 2)
+tabUnderline.Position = UDim2.new(0, 0, 1, -2)
+tabUnderline.BackgroundColor3 = Color3.fromRGB(210,55,55)
+tabUnderline.BorderSizePixel = 0
+
+local function switchTab(name)
+    activeTab = name
+    for n, p in pairs(tabPages) do p.Visible = n == name end
+    for n, b in pairs(tabBtns) do
+        b.TextColor3 = n == name and Color3.new(1,1,1) or Color3.fromRGB(150,150,160)
+    end
+    local idx = table.find(tabNames, name) or 1
+    tween(tabUnderline, {Position = UDim2.new((idx-1)/#tabNames, 0, 1, -2)}, 0.15)
+end
+
+for _, name in ipairs(tabNames) do
+    tabBtns[name].MouseButton1Click:Connect(function() switchTab(name) end)
+end
+
+-- FOV Circle
+local fovCircle = Instance.new("Frame", screenGui)
+fovCircle.Name = "FOVCircle"
+fovCircle.AnchorPoint = Vector2.new(0.5,0.5)
+fovCircle.Position = UDim2.new(0.5,0,0.5,0)
+fovCircle.Size = UDim2.new(0, CONFIG.AIMBOT_FOV*2, 0, CONFIG.AIMBOT_FOV*2)
+fovCircle.BackgroundTransparency = 1
+fovCircle.BorderSizePixel = 1
+fovCircle.BorderColor3 = Color3.fromRGB(220,220,220)
+fovCircle.Visible = false
+Instance.new("UICorner", fovCircle).CornerRadius = UDim.new(1,0)
+
+-- Status indicator
+local statusDot = Instance.new("Frame", screenGui)
+statusDot.Size = UDim2.new(0,10,0,10)
+statusDot.Position = UDim2.new(0.5,0,-0,CONFIG.AIMBOT_FOV+8)
+statusDot.AnchorPoint = Vector2.new(0.5,0)
+statusDot.BackgroundColor3 = Color3.fromRGB(80,80,80)
+statusDot.BorderSizePixel = 0
+statusDot.Visible = false
+Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1,0)
+
+---------------------------------------------------
+--// Aimbot Tab Controls
+
+local aPage = tabPages["Aimbot"]
+local ay = 8
+
+makeSectionLabel(aPage, "Core", ay); ay = ay + 22
+local aimBtn    = makeToggleBtn(aPage, "AimBtn",    "Aimbot: Off  [RAlt]", ay); ay = ay + 42
+local predBtn   = makeToggleBtn(aPage, "PredBtn",   "Prediction: On",       ay); ay = ay + 42
+local snapBtn   = makeToggleBtn(aPage, "SnapBtn",   "Instant Snap: On",     ay); ay = ay + 42
+setBtn(aimBtn,  false, "Aimbot: On  [RAlt]",  "Aimbot: Off  [RAlt]")
+setBtn(predBtn, true,  "Prediction: On",        "Prediction: Off")
+setBtn(snapBtn, true,  "Instant Snap: On",      "Instant Snap: Off")
+
+makeSectionLabel(aPage, "Checks", ay); ay = ay + 22
+local teamBtn   = makeToggleBtn(aPage, "TeamBtn",   "Team Check: On",   ay); ay = ay + 42
+local wallBtn   = makeToggleBtn(aPage, "WallBtn",   "Wall Check: On",   ay); ay = ay + 42
+local fovCkBtn  = makeToggleBtn(aPage, "FovCkBtn",  "FOV Check: On",    ay); ay = ay + 42
+setBtn(teamBtn,  true,  "Team Check: On",  "Team Check: Off")
+setBtn(wallBtn,  true,  "Wall Check: On",  "Wall Check: Off")
+setBtn(fovCkBtn, true,  "FOV Check: On",   "FOV Check: Off")
+
+makeSectionLabel(aPage, "Triggerbot", ay); ay = ay + 22
+local trigBtn   = makeToggleBtn(aPage, "TrigBtn",   "Triggerbot: Off",  ay); ay = ay + 42
+setBtn(trigBtn, false, "Triggerbot: On", "Triggerbot: Off")
+
+makeSectionLabel(aPage, "Sliders", ay); ay = ay + 22
+makeSlider(aPage, "Smoothness",        0.01, 1,    CONFIG.SMOOTHNESS,       ay, function(v) CONFIG.SMOOTHNESS = v       end); ay = ay+52
+makeSlider(aPage, "FOV Radius",        10,   500,  CONFIG.AIMBOT_FOV,       ay, function(v)
+    CONFIG.AIMBOT_FOV = v
+    fovRadiusSq = v*v
+    fovCircle.Size = UDim2.new(0,v*2,0,v*2)
+end); ay = ay+52
+makeSlider(aPage, "Max Distance",      50,   2000, CONFIG.MAX_DISTANCE,     ay, function(v) CONFIG.MAX_DISTANCE = v     end); ay = ay+52
+makeSlider(aPage, "Prediction Factor", 0,    1,    CONFIG.PREDICTION_FACTOR,ay, function(v) CONFIG.PREDICTION_FACTOR=v  end); ay = ay+52
+makeSlider(aPage, "Triggerbot Angle",  1,    15,   CONFIG.TRIGGERBOT_ANGLE, ay, function(v) CONFIG.TRIGGERBOT_ANGLE = v end); ay = ay+52
+makeSlider(aPage, "Triggerbot Delay",  0,    0.5,  CONFIG.TRIGGERBOT_DELAY, ay, function(v) CONFIG.TRIGGERBOT_DELAY = v end); ay = ay+52
+
+aPage.CanvasSize = UDim2.new(0,0,0,ay+10)
+
+---------------------------------------------------
+--// Visuals Tab Controls
+
+local vPage = tabPages["Visuals"]
+local vy = 8
+
+makeSectionLabel(vPage, "Highlights", vy); vy = vy + 22
+local hlBtn      = makeToggleBtn(vPage, "HlBtn",   "Highlight: On",      vy); vy = vy + 42
+local rainbowBtn = makeToggleBtn(vPage, "RainBtn",  "Rainbow Mode: Off",  vy); vy = vy + 42
+setBtn(hlBtn,      true,  "Highlight: On",    "Highlight: Off")
+setBtn(rainbowBtn, false, "Rainbow Mode: On", "Rainbow Mode: Off")
+
+makeSectionLabel(vPage, "ESP", vy); vy = vy + 22
+local espBtn    = makeToggleBtn(vPage, "EspBtn",    "ESP Tags: On",       vy); vy = vy + 42
+setBtn(espBtn, true, "ESP Tags: On", "ESP Tags: Off")
+
+makeSectionLabel(vPage, "360° Radar", vy); vy = vy + 22
+local radarBtn  = makeToggleBtn(vPage, "RadarBtn",  "360° Radar: On",     vy); vy = vy + 42
+setBtn(radarBtn, true, "360° Radar: On", "360° Radar: Off")
+
+makeSectionLabel(vPage, "Hitbox Expander", vy); vy = vy + 22
+local hitboxBtn = makeToggleBtn(vPage, "HitboxBtn", "Hitbox Expander: Off",vy); vy = vy + 42
+setBtn(hitboxBtn, false, "Hitbox Expander: On", "Hitbox Expander: Off")
+makeSlider(vPage, "Hitbox Size", 0.1, 5, CONFIG.HITBOX_SIZE, vy, function(v) CONFIG.HITBOX_SIZE = v end); vy = vy+52
+
+vPage.CanvasSize = UDim2.new(0,0,0,vy+10)
+
+---------------------------------------------------
+--// Settings Tab Controls
+
+local sPage = tabPages["Settings"]
+local sy = 8
+
+makeSectionLabel(sPage, "Aim Part", sy); sy = sy + 22
+
+local aimParts     = {"Head","Neck","UpperTorso","HumanoidRootPart"}
+local aimPartBtns  = {}
+for i, pname in ipairs(aimParts) do
+    local b = makeToggleBtn(sPage, "AP_"..pname, pname, sy)
+    setBtn(b, pname == CONFIG.AIM_PART, pname, pname)
+    aimPartBtns[pname] = b
+    sy = sy + 42
+end
+
+makeSectionLabel(sPage, "Sticky Target (click to lock)", sy); sy = sy + 22
+
+-- Player list frame (dynamic)
+local playerListFrame = Instance.new("Frame", sPage)
+playerListFrame.Name = "PlayerList"
+playerListFrame.Size = UDim2.new(1,-20,0,0)
+playerListFrame.Position = UDim2.new(0,10,0,sy)
+playerListFrame.BackgroundTransparency = 1
+
+local playerListLayout = Instance.new("UIListLayout", playerListFrame)
+playerListLayout.SortOrder = Enum.SortOrder.Name
+playerListLayout.Padding = UDim.new(0,4)
+playerListLayout.FillDirection = Enum.FillDirection.Vertical
+
+local stickyLbl = Instance.new("TextLabel", sPage)
+stickyLbl.Size = UDim2.new(1,-20,0,20)
+stickyLbl.BackgroundTransparency = 1
+stickyLbl.Font = Enum.Font.Gotham
+stickyLbl.TextSize = 12
+stickyLbl.TextColor3 = Color3.fromRGB(160,160,160)
+stickyLbl.TextXAlignment = Enum.TextXAlignment.Left
+stickyLbl.Text = "  Locked: None"
+
+sPage.CanvasSize = UDim2.new(0,0,0,600)
+
+---------------------------------------------------
+--// Core Feature Functions
+
+-- Hitbox
+local function removeHitbox(player)
+    local parts = playerHitboxParts[player]
+    if not parts then return end
+    for _, p in ipairs(parts) do p:Destroy() end
+    playerHitboxParts[player] = nil
+end
+
+local function applyHitbox(player)
+    if not hitboxEnabled or player == LocalPlayer then return end
+    removeHitbox(player)
+    local char = player.Character
+    if not char then return end
+    playerHitboxParts[player] = {}
+    for _, pname in ipairs(CONFIG.HITBOX_PARTS) do
+        local orig = char:FindFirstChild(pname)
+        if orig and orig:IsA("BasePart") then
+            local ex = Instance.new("Part")
+            ex.Name = "s_ick_HBX"
+            ex.Size = orig.Size + Vector3.new(CONFIG.HITBOX_SIZE,CONFIG.HITBOX_SIZE,CONFIG.HITBOX_SIZE)
+            ex.CanCollide = false; ex.CanTouch = false; ex.CanQuery = true
+            ex.Transparency = 1; ex.Anchored = false
+            ex.Parent = char
+            local weld = Instance.new("WeldConstraint", ex)
+            weld.Part0 = ex; weld.Part1 = orig
+            table.insert(playerHitboxParts[player], ex)
+        end
+    end
+end
+
+-- Highlight & pulse
+local function removeHighlight(player)
+    if pulseTweens[player] then pulseTweens[player]:Cancel(); pulseTweens[player] = nil end
+    if playerHighlights[player] then playerHighlights[player]:Destroy(); playerHighlights[player] = nil end
+end
+
+local function applyHighlight(player)
+    if not highlightEnabled or player == LocalPlayer then return end
+    local char = player.Character
+    if not char then return end
+    removeHighlight(player)
+    local hl = Instance.new("Highlight", char)
+    hl.FillColor    = CONFIG.HIGHLIGHT_FILL_COLOR
+    hl.OutlineColor = CONFIG.HIGHLIGHT_OUTLINE_COLOR
+    hl.DepthMode    = CONFIG.HIGHLIGHT_DEPTH_MODE
+    hl.FillTransparency    = 1
+    hl.OutlineTransparency = 1
+    playerHighlights[player] = hl
+    tween(hl, {FillTransparency=CONFIG.HIGHLIGHT_FILL_TRANS, OutlineTransparency=CONFIG.HIGHLIGHT_OUTLINE_TRANS}, 0.4)
+
+    local function pulse()
+        if not hl or not hl.Parent then return end
+        local t1 = tween(hl, {FillTransparency=CONFIG.HIGHLIGHT_PULSE_MIN}, CONFIG.HIGHLIGHT_PULSE_DURATION/2)
+        pulseTweens[player] = t1
+        t1.Completed:Connect(function()
+            if not hl or not hl.Parent then return end
+            local t2 = tween(hl, {FillTransparency=CONFIG.HIGHLIGHT_PULSE_MAX}, CONFIG.HIGHLIGHT_PULSE_DURATION/2)
+            pulseTweens[player] = t2
+            t2.Completed:Connect(pulse)
+        end)
+    end
+    pulse()
+end
+
+-- ESP Tags
+local function removeESP(player)
+    if playerESP[player] then
+        if playerESP[player].bill then playerESP[player].bill:Destroy() end
+        playerESP[player] = nil
+    end
+end
+
+local function applyESP(player)
+    if not espEnabled or player == LocalPlayer then return end
+    local char = player.Character
+    if not char then return end
+    removeESP(player)
+    local head = char:FindFirstChild("Head")
+    if not head then return end
+
+    local bill = Instance.new("BillboardGui", head)
+    bill.Name = "s_ick_ESP"
+    bill.Size = UDim2.new(0, 120, 0, 52)
+    bill.StudsOffset = Vector3.new(0, 2.2, 0)
+    bill.AlwaysOnTop = true
+    bill.LightInfluence = 0
+
+    local nameLbl = Instance.new("TextLabel", bill)
+    nameLbl.Size = UDim2.new(1,0,0,20)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Font = CONFIG.ESP_FONT
+    nameLbl.TextSize = CONFIG.ESP_TEXT_SIZE
+    nameLbl.TextColor3 = Color3.new(1,1,1)
+    nameLbl.TextStrokeTransparency = 0.5
+    nameLbl.Text = player.Name
+
+    local distLbl = Instance.new("TextLabel", bill)
+    distLbl.Size = UDim2.new(1,0,0,16)
+    distLbl.Position = UDim2.new(0,0,0,20)
+    distLbl.BackgroundTransparency = 1
+    distLbl.Font = Enum.Font.Gotham
+    distLbl.TextSize = 11
+    distLbl.TextColor3 = Color3.fromRGB(200,200,200)
+    distLbl.TextStrokeTransparency = 0.5
+    distLbl.Text = "..."
+
+    -- Health bar background
+    local hpBg = Instance.new("Frame", bill)
+    hpBg.Size = UDim2.new(1, -4, 0, 5)
+    hpBg.Position = UDim2.new(0, 2, 0, 38)
+    hpBg.BackgroundColor3 = Color3.fromRGB(40,40,40)
+    hpBg.BorderSizePixel = 0
+    corner(hpBg, UDim.new(1,0))
+
+    local hpFill = Instance.new("Frame", hpBg)
+    hpFill.Size = UDim2.new(1,0,1,0)
+    hpFill.BackgroundColor3 = Color3.fromRGB(80,210,80)
+    hpFill.BorderSizePixel = 0
+    corner(hpFill, UDim.new(1,0))
+
+    playerESP[player] = {bill=bill, distLbl=distLbl, hpFill=hpFill, char=char}
+end
+
+-- Threat Indicators
+local function removeThreatIndicator(player)
+    if threatIndicators[player] then threatIndicators[player]:Destroy(); threatIndicators[player] = nil end
+end
+
+local function createOrUpdateThreat(player, angle)
+    local ind = threatIndicators[player]
+    if not ind then
+        ind = Instance.new("Frame", screenGui)
+        ind.Size = UDim2.new(0,CONFIG.THREAT_INDICATOR_SIZE,0,CONFIG.THREAT_INDICATOR_SIZE)
+        ind.AnchorPoint = Vector2.new(0.5,0.5)
+        ind.BackgroundColor3 = CONFIG.THREAT_INDICATOR_COLOR
+        ind.BorderSizePixel = 0
+        ind.ZIndex = 10
+        corner(ind, UDim.new(0,4))
+        local arrow = Instance.new("TextLabel", ind)
+        arrow.Size = UDim2.new(1,0,1,0)
+        arrow.BackgroundTransparency = 1
+        arrow.TextColor3 = Color3.new(1,1,1)
+        arrow.TextSize = 18
+        arrow.Font = Enum.Font.GothamBold
+        arrow.Name = "Arrow"
+        threatIndicators[player] = ind
+    end
+    local vp = Camera.ViewportSize
+    ind.Position = UDim2.new(0, vp.X/2 + math.cos(angle)*CONFIG.THREAT_INDICATOR_DIST,
+                              0, vp.Y/2 + math.sin(angle)*CONFIG.THREAT_INDICATOR_DIST)
+    local arrow = ind:FindFirstChild("Arrow")
+    if arrow then
+        local deg = math.deg(angle)
+        arrow.Text = (deg > -90 and deg < 90) and "◄" or "►"
+        arrow.Rotation = deg
+    end
+    ind.Visible = true
+end
+
+local function scan360()
+    if not threatEnabled then
+        for p in pairs(threatIndicators) do removeThreatIndicator(p) end
+        return
+    end
+    local now = tick()
+    if now - lastThreatScan < CONFIG.THREAT_SCAN_INTERVAL then return end
+    lastThreatScan = now
+
+    local lc = LocalPlayer.Character
+    if not lc then return end
+    local lr = lc.PrimaryPart or lc:FindFirstChild("HumanoidRootPart")
+    if not lr then return end
+
+    local found = {}
+    for player in pairs(playerConnections) do
+        if player == LocalPlayer then continue end
+        local char = player.Character
+        if not char then continue end
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        local root = char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")
+        if hum and hum.Health > 0 and root then
+            local dist = (root.Position - lr.Position).Magnitude
+            if dist >= CONFIG.THREAT_MIN_DISTANCE and dist <= CONFIG.THREAT_MAX_DISTANCE then
+                local vp = Camera.ViewportSize
+                local sc = Vector2.new(vp.X/2, vp.Y/2)
+                local sp = Camera:WorldToScreenPoint(root.Position)
+                local sp2 = Vector2.new(sp.X, sp.Y)
+                if (sp2-sc).Magnitude^2 > fovRadiusSq then
+                    local toT = Vector3.new(root.Position.X-lr.Position.X, 0, root.Position.Z-lr.Position.Z).Unit
+                    local cr  = Vector3.new(Camera.CFrame.RightVector.X, 0, Camera.CFrame.RightVector.Z).Unit
+                    local cf  = Vector3.new(Camera.CFrame.LookVector.X,  0, Camera.CFrame.LookVector.Z).Unit
+                    createOrUpdateThreat(player, math.atan2(toT:Dot(cr), toT:Dot(cf)))
+                    found[player] = true
+                end
+            end
+        end
+    end
+    for p in pairs(threatIndicators) do
+        if not found[p] then removeThreatIndicator(p) end
+    end
+end
+
+-- Visibility cache
+local function checkVisible(char, targetPart, lc)
+    local now = tick()
+    local cached = visibilityCache[char]
+    if cached and (now - cached.t) < CONFIG.VISIBILITY_CHECK_INTERVAL then return cached.v end
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Blacklist
+    rp.FilterDescendantsInstances = {lc}
+    local dir = (targetPart.Position - Camera.CFrame.Position).Unit
+    local res = Workspace:Raycast(Camera.CFrame.Position, dir * CONFIG.MAX_DISTANCE, rp)
+    local v = (not res) or (res.Instance and res.Instance:IsDescendantOf(char))
+    visibilityCache[char] = {v=v, t=now}
+    return v
+end
+
+local function inFOV(pos)
+    local vp = Camera.ViewportSize
+    local sc = Vector2.new(vp.X/2, vp.Y/2)
+    local sp, onScreen = Camera:WorldToScreenPoint(pos)
+    if not onScreen then return false end
+    return (Vector2.new(sp.X, sp.Y) - sc).Magnitude^2 <= fovRadiusSq
+end
+
+---------------------------------------------------
+--// Target Selection
+
+local function getTarget()
+    local bestPart, bestScore = nil, math.huge
+    local lc = LocalPlayer.Character
+    if not lc then return nil end
+    local lr = lc.PrimaryPart or lc:FindFirstChild("HumanoidRootPart")
+    if not lr then return nil end
+
+    local vp = Camera.ViewportSize
+    local sc = Vector2.new(vp.X/2, vp.Y/2)
+
+    -- If sticky target is set, only aim at them
+    if stickyTarget and stickyTarget.Character then
+        local char = stickyTarget.Character
+        local part = char:FindFirstChild(CONFIG.AIM_PART) or char:FindFirstChild("Head")
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        if part and hum and hum.Health > 0 then
+            return part, 0
+        else
+            stickyTarget = nil
+            stickyLbl.Text = "  Locked: None"
+        end
+    end
+
+    for player in pairs(playerConnections) do
+        if player == LocalPlayer then continue end
+        if teamCheckEnabled and player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then continue end
+        local char = player.Character
+        if not char then continue end
+        local part = char:FindFirstChild(CONFIG.AIM_PART) or char:FindFirstChild("Head")
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        if not part or not hum or hum.Health <= 0 then continue end
+        local root = char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")
+        if not root then continue end
+
+        if fovCheckEnabled and not inFOV(part.Position) then continue end
+        if wallCheckEnabled and not checkVisible(char, part, lc) then continue end
+
+        local worldDist = (root.Position - lr.Position).Magnitude
+        local sp, onScreen = Camera:WorldToScreenPoint(part.Position)
+        local screenDist = onScreen and (Vector2.new(sp.X, sp.Y) - sc).Magnitude or CONFIG.AIMBOT_FOV
+        local healthRatio = hum.Health / math.max(hum.MaxHealth, 1)
+
+        local score = (worldDist * CONFIG.DISTANCE_WEIGHT)
+                    + (screenDist * CONFIG.FOV_WEIGHT)
+                    + (healthRatio * 100 * CONFIG.HEALTH_WEIGHT)
+
+        if previousTarget and player == previousTarget then score = score * 0.88 end
+
+        if score < bestScore then
+            bestScore = score
+            bestPart  = part
+        end
+    end
+    return bestPart, bestScore
+end
+
+---------------------------------------------------
+--// Player List (Settings Tab)
+
+local playerListItems = {}
+
+local function updatePlayerList()
+    for _, item in pairs(playerListItems) do item:Destroy() end
+    playerListItems = {}
+    local totalH = 0
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local row = Instance.new("TextButton", playerListFrame)
+        row.Size = UDim2.new(1, 0, 0, 30)
+        row.BackgroundColor3 = (stickyTarget == player) and Color3.fromRGB(180,40,40) or Color3.fromRGB(40,40,50)
+        row.Font = Enum.Font.Gotham
+        row.TextSize = 13
+        row.TextColor3 = Color3.new(1,1,1)
+        row.Text = player.Name
+        corner(row, UDim.new(0,5))
+        table.insert(playerListItems, row)
+        totalH = totalH + 34
+        row.MouseButton1Click:Connect(function()
+            if stickyTarget == player then
+                stickyTarget = nil
+                stickyLbl.Text = "  Locked: None"
+            else
+                stickyTarget = player
+                stickyLbl.Text = "  Locked: " .. player.Name
+            end
+            updatePlayerList()
+        end)
+    end
+    playerListFrame.Size = UDim2.new(1,-20,0,totalH)
+    -- Update stickyLbl position
+    stickyLbl.Position = UDim2.new(0,10,0, sy + totalH + 6)
+    sPage.CanvasSize = UDim2.new(0,0,0, sy + totalH + 40)
+end
+
+---------------------------------------------------
+--// Player Connection Handlers
+
+local function onPlayerAdded(player)
+    playerConnections[player] = {}
+    playerConnections[player].CharacterAdded = player.CharacterAdded:Connect(function()
+        task.wait(0.15)
+        applyHighlight(player)
+        applyHitbox(player)
+        applyESP(player)
+    end)
+    if player.Character then
+        applyHighlight(player)
+        applyHitbox(player)
+        applyESP(player)
+    end
+    updatePlayerList()
+end
+
+local function onPlayerRemoving(player)
+    removeHighlight(player)
+    removeHitbox(player)
+    removeESP(player)
+    removeThreatIndicator(player)
+    if playerConnections[player] then
+        for _, c in pairs(playerConnections[player]) do c:Disconnect() end
+        playerConnections[player] = nil
+    end
+    if player.Character then
+        visibilityCache[player.Character] = nil
+        local root = player.Character.PrimaryPart or player.Character:FindFirstChild("HumanoidRootPart")
+        if root then targetKalman[root] = nil end
+    end
+    if stickyTarget == player then
+        stickyTarget = nil
+        stickyLbl.Text = "  Locked: None"
+    end
+    updatePlayerList()
+end
+
+---------------------------------------------------
+--// Button Connections
+
+aimBtn.MouseButton1Click:Connect(function()
+    btnBounce(aimBtn)
+    aimbotEnabled = not aimbotEnabled
+    setBtn(aimBtn, aimbotEnabled, "Aimbot: On  [RAlt]", "Aimbot: Off  [RAlt]")
+    fovCircle.Visible = aimbotEnabled and fovCheckEnabled
+    statusDot.Visible = aimbotEnabled and fovCheckEnabled
+    statusDot.BackgroundColor3 = aimbotEnabled and Color3.fromRGB(80,220,80) or Color3.fromRGB(80,80,80)
+end)
+
+predBtn.MouseButton1Click:Connect(function()
+    btnBounce(predBtn)
+    CONFIG.PREDICTION_ENABLED = not CONFIG.PREDICTION_ENABLED
+    setBtn(predBtn, CONFIG.PREDICTION_ENABLED, "Prediction: On", "Prediction: Off")
+end)
+
+snapBtn.MouseButton1Click:Connect(function()
+    btnBounce(snapBtn)
+    CONFIG.INSTANT_SNAP = not CONFIG.INSTANT_SNAP
+    setBtn(snapBtn, CONFIG.INSTANT_SNAP, "Instant Snap: On", "Instant Snap: Off")
+end)
+
+teamBtn.MouseButton1Click:Connect(function()
+    btnBounce(teamBtn); teamCheckEnabled = not teamCheckEnabled
+    setBtn(teamBtn, teamCheckEnabled, "Team Check: On", "Team Check: Off")
+end)
+
+wallBtn.MouseButton1Click:Connect(function()
+    btnBounce(wallBtn); wallCheckEnabled = not wallCheckEnabled
+    setBtn(wallBtn, wallCheckEnabled, "Wall Check: On", "Wall Check: Off")
+end)
+
+fovCkBtn.MouseButton1Click:Connect(function()
+    btnBounce(fovCkBtn); fovCheckEnabled = not fovCheckEnabled
+    setBtn(fovCkBtn, fovCheckEnabled, "FOV Check: On", "FOV Check: Off")
+    fovCircle.Visible = fovCheckEnabled and aimbotEnabled
+    statusDot.Visible = fovCheckEnabled and aimbotEnabled
+end)
+
+trigBtn.MouseButton1Click:Connect(function()
+    btnBounce(trigBtn); triggerbotEnabled = not triggerbotEnabled
+    setBtn(trigBtn, triggerbotEnabled, "Triggerbot: On", "Triggerbot: Off")
+end)
+
+hlBtn.MouseButton1Click:Connect(function()
+    btnBounce(hlBtn); highlightEnabled = not highlightEnabled
+    setBtn(hlBtn, highlightEnabled, "Highlight: On", "Highlight: Off")
+    for player in pairs(playerConnections) do
+        if highlightEnabled then applyHighlight(player) else removeHighlight(player) end
+    end
+end)
+
+rainbowBtn.MouseButton1Click:Connect(function()
+    btnBounce(rainbowBtn); rainbowMode = not rainbowMode
+    setBtn(rainbowBtn, rainbowMode, "Rainbow Mode: On", "Rainbow Mode: Off")
+end)
+
+espBtn.MouseButton1Click:Connect(function()
+    btnBounce(espBtn); espEnabled = not espEnabled
+    setBtn(espBtn, espEnabled, "ESP Tags: On", "ESP Tags: Off")
+    for player in pairs(playerConnections) do
+        if espEnabled then applyESP(player) else removeESP(player) end
+    end
+end)
+
+radarBtn.MouseButton1Click:Connect(function()
+    btnBounce(radarBtn); threatEnabled = not threatEnabled
+    setBtn(radarBtn, threatEnabled, "360° Radar: On", "360° Radar: Off")
+    if not threatEnabled then
+        for p in pairs(threatIndicators) do removeThreatIndicator(p) end
+    end
+end)
+
+hitboxBtn.MouseButton1Click:Connect(function()
+    btnBounce(hitboxBtn); hitboxEnabled = not hitboxEnabled
+    setBtn(hitboxBtn, hitboxEnabled, "Hitbox Expander: On", "Hitbox Expander: Off")
+    for player in pairs(playerConnections) do
+        if hitboxEnabled then applyHitbox(player) else removeHitbox(player) end
+    end
+end)
+
+for pname, btn in pairs(aimPartBtns) do
+    btn.MouseButton1Click:Connect(function()
+        CONFIG.AIM_PART = pname
+        for n, b in pairs(aimPartBtns) do
+            setBtn(b, n == pname, n, n)
+        end
+    end)
+end
+
+minBtn.MouseButton1Click:Connect(function()
+    guiMinimized = not guiMinimized
+    minBtn.Text = guiMinimized and "+" or "−"
+    local targetH = guiMinimized and 42 or 540
+    tween(win, {Size = UDim2.new(0,320,0,targetH)}, 0.25)
+end)
+
+local function closeAll()
+    for player in pairs(playerConnections) do
+        for _, c in pairs(playerConnections[player]) do c:Disconnect() end
+    end
+    playerConnections = {}
+    for p in pairs(threatIndicators) do removeThreatIndicator(p) end
+    screenGui:Destroy()
+end
+
+closeWinBtn.MouseButton1Click:Connect(closeAll)
+screenGui.Destroying:Connect(closeAll)
+
+---------------------------------------------------
+--// Keybinds
+
+UserInputService.InputBegan:Connect(function(inp, gpe)
+    if gpe then return end
+    if inp.KeyCode == CONFIG.TOGGLE_KEY then
+        aimbotEnabled = not aimbotEnabled
+        setBtn(aimBtn, aimbotEnabled, "Aimbot: On  [RAlt]", "Aimbot: Off  [RAlt]")
+        fovCircle.Visible = aimbotEnabled and fovCheckEnabled
+        statusDot.Visible = aimbotEnabled and fovCheckEnabled
+        statusDot.BackgroundColor3 = aimbotEnabled and Color3.fromRGB(80,220,80) or Color3.fromRGB(80,80,80)
+    elseif inp.KeyCode == CONFIG.CLOSE_KEY then
+        closeAll()
+    end
+    if inp.UserInputType == CONFIG.AIM_KEY then
+        aimKeyHeld = true
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(inp)
+    if inp.UserInputType == CONFIG.AIM_KEY then
+        aimKeyHeld = false
+    end
+end)
+
+---------------------------------------------------
+--// Main Loop
+
+local rainbowHue = 0
+
+RunService.RenderStepped:Connect(function(dt)
+    -- Rainbow highlight cycle
+    if rainbowMode then
+        rainbowHue = (rainbowHue + dt * 0.3) % 1
+        local col = hsvToColor(rainbowHue)
+        for _, hl in pairs(playerHighlights) do
+            hl.FillColor = col
+        end
+    end
+
+    -- ESP update (distance + health)
+    if espEnabled then
+        local lc = LocalPlayer.Character
+        local lr = lc and (lc.PrimaryPart or lc:FindFirstChild("HumanoidRootPart"))
+        for player, esp in pairs(playerESP) do
+            if not esp or not esp.bill or not esp.bill.Parent then continue end
+            local char = player.Character
+            if not char then continue end
+            local root = char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")
+            local hum  = char:FindFirstChildOfClass("Humanoid")
+            if root and lr then
+                local dist = math.floor((root.Position - lr.Position).Magnitude)
+                esp.distLbl.Text = dist .. " studs"
+            end
+            if hum then
+                local pct = math.clamp(hum.Health / math.max(hum.MaxHealth,1), 0, 1)
+                esp.hpFill.Size = UDim2.new(pct, 0, 1, 0)
+                -- Color green -> yellow -> red
+                esp.hpFill.BackgroundColor3 = Color3.fromRGB(
+                    math.floor(255*(1-pct)), math.floor(255*pct), 0)
+            end
+        end
+    end
+
+    -- 360° radar
+    scan360()
+
+    -- Aimbot (active when enabled AND aim key held, or just enabled if AIM_KEY is handled separately)
+    local shouldAim = aimbotEnabled and aimKeyHeld
+    if shouldAim and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Head") then
+        local targetPart, targetScore = getTarget()
+        if targetPart then
+            -- Update target memory
+            if previousTarget and previousTarget ~= targetPart then
+                if targetScore < previousTargetScore * CONFIG.TARGET_SWITCH_THRESHOLD then
+                    previousTarget      = targetPart.Parent
+                    previousTargetScore = targetScore
+                end
+            else
+                previousTarget      = targetPart.Parent
+                previousTargetScore = targetScore
+            end
+
+            local predictedPos = targetPart.Position
+            local char       = targetPart.Parent
+            local targetRoot = char and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart"))
+
+            -- Enhanced Kalman prediction with acceleration
+            if CONFIG.PREDICTION_ENABLED and targetRoot and targetRoot:IsA("BasePart") then
+                local lc   = LocalPlayer.Character
+                local lr   = lc and (lc.PrimaryPart or lc:FindFirstChild("HumanoidRootPart"))
+                local mVel = targetRoot.Velocity
+                local state = targetKalman[targetRoot]
+                if not state then
+                    state = {
+                        velocity    = mVel,
+                        acceleration= Vector3.new(),
+                        uncertainty = CONFIG.INITIAL_UNCERTAINTY,
+                        lastVelocity= mVel,
+                        lastTime    = tick()
+                    }
+                end
+                local now = tick()
+                local tdelta = now - state.lastTime
+                if tdelta > 0 then
+                    local mAccel       = (mVel - state.lastVelocity) / tdelta
+                    local predVel      = state.velocity + state.acceleration * tdelta
+                    local velResidual  = mVel - predVel
+                    local kg           = state.uncertainty / (state.uncertainty + CONFIG.MEASUREMENT_NOISE)
+                    state.velocity     = predVel + velResidual * kg
+                    state.uncertainty  = (1-kg) * state.uncertainty + CONFIG.PROCESS_NOISE
+                    state.acceleration = state.acceleration + (mAccel - state.acceleration) * 0.3
+                    state.lastVelocity = mVel
+                    state.lastTime     = now
+                end
+                targetKalman[targetRoot] = state
+
+                local dist  = lr and (targetRoot.Position - lr.Position).Magnitude or 0
+                local nDist = math.min(dist / CONFIG.BASE_DISTANCE, 3)
+                local mult  = math.clamp(1 + (math.exp(nDist*0.5)-1)*0.4, 1, CONFIG.MAX_MULTIPLIER)
+                local predT = CONFIG.PREDICTION_FACTOR * mult
+                predictedPos = targetRoot.Position
+                             + state.velocity     * predT
+                             + state.acceleration * (predT*predT*0.5)
+            end
+
+            local targetCF   = CFrame.new(Camera.CFrame.Position, predictedPos)
+            local curLook    = Camera.CFrame.LookVector
+            local desiredLook= (predictedPos - Camera.CFrame.Position).Unit
+            local angleErr   = math.acos(math.clamp(curLook:Dot(desiredLook), -1, 1))
+
+            pidIntegral  = math.clamp(pidIntegral + angleErr*dt, -0.3, 0.3)
+            local deriv  = (angleErr - prevError) / dt
+            prevError    = angleErr
+            local pidOut = 0.020*angleErr + 0.0002*pidIntegral + 0.006*deriv
+            local ff     = CONFIG.PREDICTION_ENABLED and targetRoot and targetRoot:IsA("BasePart")
+                           and (0.007 * targetRoot.Velocity.Magnitude) or 0
+            local raw    = math.clamp(pidOut + ff, 0, 1)
+            filteredOutput = raw  -- no extra smoothing (smoothness handled by lerp below)
+
+            if CONFIG.INSTANT_SNAP then
+                Camera.CFrame = targetCF
+            else
+                Camera.CFrame = Camera.CFrame:Lerp(targetCF, math.clamp(CONFIG.SMOOTHNESS, 0.01, 1))
+            end
+
+            -- Triggerbot
+            if triggerbotEnabled and math.deg(angleErr) < CONFIG.TRIGGERBOT_ANGLE then
+                task.delay(CONFIG.TRIGGERBOT_DELAY, function()
+                    local m = LocalPlayer:GetMouse()
+                    local vim = pcall(function() return game:GetService("VirtualInputManager") end)
+                    if vim then
+                        local vs = game:GetService("VirtualInputManager")
+                        vs:SendMouseButtonEvent(m.X, m.Y, 0, true,  game, 0)
+                        task.wait(0.01)
+                        vs:SendMouseButtonEvent(m.X, m.Y, 0, false, game, 0)
+                    end
+                end)
+            end
+        end
+    end
+end)
+
+---------------------------------------------------
+--// Init
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(onPlayerRemoving)
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then onPlayerAdded(p) end
+end
+
+-- Animate loading bar then show main GUI
+task.wait(0.4)
+tween(barFill, {Size = UDim2.new(1,0,1,0)}, 1.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out).Completed:Wait()
+task.wait(0.25)
+tween(loadBg, {BackgroundTransparency=1}, 0.45).Completed:Connect(function() loadGui:Destroy() end)
+screenGui.Enabled = true
+
+print("s.ick Aimbot v3.0 loaded. Hold RMB to aim. RAlt = toggle. Del = close.")
