@@ -1,6 +1,6 @@
 ---------------------------------------------------
 --[[
-   s.ick Aimbot v2.12 - Full 360-Degree Targeting
+   s.ick Aimbot v2.13 - Full 360-Degree Targeting
    Enhancements:
    - Instant camera snapping via high AIMBOT_SMOOTHNESS.
    - noRecoil mode enabled (instant snapping without recoil adjustments).
@@ -34,6 +34,13 @@
    - Wall Check: toggle visibility requirement on/off in GUI
    - FOV Check: toggle FOV restriction on/off in GUI
    - Aim Sensitivity: adjustable sensitivity multiplier for aim speed
+   
+   New Features (v2.13):
+   - Mobile Support: auto-detects mobile devices and adapts GUI accordingly
+   - Floating toggle button on mobile for easy show/hide without blocking movement
+   - Smaller GUI on mobile to leave more screen space for gameplay
+   - Fixed CanvasSize so all settings (including Triggerbot) are visible when scrolling
+   - GUI no longer blocks touch input when hidden on mobile
 ]]--
 
 ---------------------------------------------------
@@ -43,7 +50,11 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local GuiService = game:GetService("GuiService")
 local Workspace = workspace
+
+-- Mobile Detection
+local isMobile = (UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled)
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -365,8 +376,8 @@ barFillCorner.CornerRadius = UDim.new(1, 0)
 -- Main UI Frame
 local mainFrame = Instance.new("Frame", screenGui)
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 300, 0, 550)
-mainFrame.Position = UDim2.new(0.05, 0, 0.5, -275)
+mainFrame.Size = isMobile and UDim2.new(0, 260, 0, 420) or UDim2.new(0, 300, 0, 550)
+mainFrame.Position = isMobile and UDim2.new(0.02, 0, 0.5, -210) or UDim2.new(0.05, 0, 0.5, -275)
 mainFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
 mainFrame.BorderSizePixel = 1
 mainFrame.BorderColor3 = Color3.fromRGB(55, 55, 65)
@@ -432,7 +443,7 @@ contentFrame.BackgroundTransparency = 1
 contentFrame.ClipsDescendants = true
 contentFrame.ScrollBarThickness = 4
 contentFrame.ScrollBarImageColor3 = Color3.fromRGB(150, 150, 150)
-contentFrame.CanvasSize = UDim2.new(0, 0, 0, 780)
+contentFrame.CanvasSize = UDim2.new(0, 0, 0, 860)
 contentFrame.BorderSizePixel = 0
 
 local creditsLabel = Instance.new("TextLabel", contentFrame)
@@ -1125,9 +1136,14 @@ end)
 
 local function toggleGuiVisibility(minimized)
    guiMinimized = minimized
-   local targetSize = minimized and UDim2.new(0, 300, 0, 40) or UDim2.new(0, 300, 0, 550)
+   local targetSize = minimized and UDim2.new(0, 300, 0, 40) or (isMobile and UDim2.new(0, 260, 0, 420) or UDim2.new(0, 300, 0, 550))
    local contentTransparency = minimized and 1 or 0
    minimizeBtn.Text = minimized and "O" or "_"
+   
+   -- On mobile, disable Active when minimized so touch passes through to game
+   if isMobile then
+      contentFrame.Visible = not minimized
+   end
    
    tweenProperty(mainFrame, {Size = targetSize}, 0.3)
    
@@ -1172,6 +1188,40 @@ end
 closeBtn.MouseButton1Click:Connect(cleanup)
 screenGui.Destroying:Connect(cleanup)
 
+-- Mobile Floating Toggle Button
+local mobileToggleBtn
+if isMobile then
+   mobileToggleBtn = Instance.new("TextButton", screenGui)
+   mobileToggleBtn.Name = "MobileToggle"
+   mobileToggleBtn.Size = UDim2.new(0, 50, 0, 50)
+   mobileToggleBtn.Position = UDim2.new(0, 10, 0, 10)
+   mobileToggleBtn.AnchorPoint = Vector2.new(0, 0)
+   mobileToggleBtn.Text = "☰"
+   mobileToggleBtn.Font = Enum.Font.GothamBold
+   mobileToggleBtn.TextSize = 24
+   mobileToggleBtn.TextColor3 = Color3.new(1, 1, 1)
+   mobileToggleBtn.BackgroundColor3 = Color3.fromRGB(220, 50, 50)
+   mobileToggleBtn.BackgroundTransparency = 0.3
+   mobileToggleBtn.ZIndex = 10
+   mobileToggleBtn.Active = true
+   local mobileToggleCorner = Instance.new("UICorner", mobileToggleBtn)
+   mobileToggleCorner.CornerRadius = UDim.new(1, 0)
+   
+   -- Start with GUI hidden on mobile so it doesn't block movement
+   mainFrame.Visible = false
+   
+   mobileToggleBtn.MouseButton1Click:Connect(function()
+      mainFrame.Visible = not mainFrame.Visible
+      if mainFrame.Visible then
+         mobileToggleBtn.Text = "✕"
+         mobileToggleBtn.BackgroundTransparency = 0
+      else
+         mobileToggleBtn.Text = "☰"
+         mobileToggleBtn.BackgroundTransparency = 0.3
+      end
+   end)
+end
+
 ---------------------------------------------------
 --// Startup Execution
 
@@ -1191,4 +1241,4 @@ local fadeOutTween = tweenProperty(loadingBg, {BackgroundTransparency = 1}, 0.5)
 fadeOutTween.Completed:Connect(function() loadingGui:Destroy() end)
 screenGui.Enabled = true
 
-print("s.ick Aimbot v2.12: Full 360-degree targeting enabled - triggerbot, team check, wall check, FOV check, aim sensitivity, optimized reaction speed, enhanced prediction with acceleration tracking, and complete spherical aiming capability loaded successfully.")
+print("s.ick Aimbot v2.13: Full 360-degree targeting enabled - triggerbot, team check, wall check, FOV check, aim sensitivity, mobile support, optimized reaction speed, enhanced prediction with acceleration tracking, and complete spherical aiming capability loaded successfully.")
