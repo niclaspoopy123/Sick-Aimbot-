@@ -529,7 +529,7 @@ setBtn(trigBtn, false, "Triggerbot: On", "Triggerbot: Off")
 
 makeSectionLabel(aPage, "Sliders", ay); ay = ay + 24
 makeSlider(aPage, "Sensitivity",       0.1,  3,    CONFIG.SENSITIVITY,       ay, function(v) CONFIG.SENSITIVITY = v        end); ay = ay+52
-makeSlider(aPage, "Smoothness",        0.01, 1,    CONFIG.SMOOTHNESS,        ay, function(v) CONFIG.SMOOTHNESS = v         end); ay = ay+52
+makeSlider(aPage, "Smoothness",        0,    1,    CONFIG.SMOOTHNESS,        ay, function(v) CONFIG.SMOOTHNESS = v         end); ay = ay+52
 makeSlider(aPage, "FOV Radius",        10,   500,  CONFIG.AIMBOT_FOV,        ay, function(v)
     CONFIG.AIMBOT_FOV = v
     fovRadiusSq = v*v
@@ -1212,13 +1212,13 @@ UserInputService.InputBegan:Connect(function(inp, gpe)
     elseif inp.KeyCode == CONFIG.CLOSE_KEY then
         closeAll()
     end
-    if inp.UserInputType == CONFIG.AIM_KEY then
+    if inp.UserInputType == CONFIG.AIM_KEY or inp.KeyCode == Enum.KeyCode.RightAlt then
         aimKeyHeld = true
     end
 end)
 
 UserInputService.InputEnded:Connect(function(inp)
-    if inp.UserInputType == CONFIG.AIM_KEY then
+    if inp.UserInputType == CONFIG.AIM_KEY or inp.KeyCode == Enum.KeyCode.RightAlt then
         aimKeyHeld = false
     end
 end)
@@ -1420,7 +1420,7 @@ RunService.RenderStepped:Connect(function(dt)
             if CONFIG.INSTANT_SNAP then
                 Camera.CFrame = targetCF
             else
-                Camera.CFrame = Camera.CFrame:Lerp(targetCF, math.clamp(CONFIG.SMOOTHNESS * CONFIG.SENSITIVITY, 0.01, 1))
+                Camera.CFrame = Camera.CFrame:Lerp(targetCF, math.clamp(CONFIG.SMOOTHNESS * CONFIG.SENSITIVITY, 0, 1))
             end
 
             -- Triggerbot: fire only when on-target and cooldown elapsed
